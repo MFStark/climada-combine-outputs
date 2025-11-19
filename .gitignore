@@ -185,3 +185,7 @@ results/
 !.github
 climada_petals/
 climada_python/
+
+# Jupyter scratch space
+/notebooks
+

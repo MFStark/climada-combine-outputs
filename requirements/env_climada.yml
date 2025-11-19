@@ -3,6 +3,7 @@ channels:
   - conda-forge
   - nodefaults
 dependencies:
+  - python=3.11
   - bayesian-optimization>=1.5,<2.0
   - bottleneck>=1.6
   - cartopy>=0.25
