@@ -10,26 +10,31 @@ from rra_tools.parallel import run_parallel  # type: ignore
 import os
 
 DRAW_BATCHES = [
-"0-4",
-"5-9",
-"10-14",
-"15-19",
-"20-24",
-"25-29",
-"30-34",
-"35-39",
-"40-44",
-"45-49",
-"50-54",
-"55-59",
-"60-64",
-"65-69",
-"70-74",
-"75-79",
-"80-84",
-"85-89",
-"90-94",
-"95-99",
+# "0-4",
+# "0-0",
+"1-1",
+# "2-2",
+# "3-3",
+# "4-4",
+# "5-9",
+# "10-14",
+# "15-19",
+# "20-24",
+# "25-29",
+# "30-34",
+# "35-39",
+# "40-44",
+# "45-49",
+# "50-54",
+# "55-59",
+# "60-64",
+# "65-69",
+# "70-74",
+# "75-79",
+# "80-84",
+# "85-89",
+# "90-94",
+# "95-99",
 ]
 
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
@@ -144,8 +149,33 @@ meta_df = meta_df.rename(columns={
     "time_period": "batch_year",
 })
 
+# test one model 
+source_id = "CMCC-ESM2"
+variant_label = "r1i1p1f1"
+basin = "EP"
+
+meta_df = meta_df[
+    (meta_df["source_id"] == source_id) &
+    (meta_df["variant_label"] == variant_label) 
+]
+historical_df = meta_df[meta_df["batch_year"] == "2011-2014"]
+ssp126_df = meta_df[meta_df["batch_year"] == "2070-2074"]
+ssp245_df = meta_df[meta_df["batch_year"] == "2029-2032"]
+ssp585_df = meta_df[meta_df["batch_year"] == "2046-2048"]
+
+sample_df = pd.concat([historical_df, ssp126_df, ssp245_df, ssp585_df])
+
+# test failed CLIMADA_stage0_CMCC-ESM2_r1i1p1f1_ssp245_2029-2032_NI_d0-4_c5 
+sample_df = sample_df[
+    (sample_df["source_id"] == "CMCC-ESM2") & 
+    (sample_df["variant_label"] == "r1i1p1f1") &
+    (sample_df["experiment_id"] == "ssp245") &
+    (sample_df["batch_year"] == "2029-2032") & 
+    (sample_df["basin"] == "NI")
+]
+
 # get storm counts
-meta_df_storm_counts = run_storm_count_parallel(meta_df)
+meta_df_storm_counts = run_storm_count_parallel(sample_df)
 
 # Assign run times based on storm counts
 meta_df_storm_counts = meta_df_storm_counts.apply(assign_run_time, axis=1)
@@ -159,18 +189,6 @@ full_tasks_df = (
 )
 
 
-# # sample df to run
-# full_tasks_df = pd.read_csv("/mnt/share/homes/mfiking/downloads/stage0_sample_draws_05.csv")
-
-# # replace nan basin with "NA"
-# full_tasks_df["basin"] = full_tasks_df["basin"].fillna("NA")
-
-# # create full tasks by cross-joining with draw batches
-# full_tasks_df = (
-#     full_tasks_df.assign(key=1)
-#     .merge(pd.DataFrame({"draw_batch": DRAW_BATCHES, "key": 1}), on="key")
-#     .drop(columns=["key"])
-# )
 
 user = getpass.getuser()
 
