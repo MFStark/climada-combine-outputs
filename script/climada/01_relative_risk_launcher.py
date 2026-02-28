@@ -11,11 +11,6 @@ import xarray as xr # type: ignore
 
 RELATIVE_RISKS = ["indirect_resp_draw", "indirect_cvd_draw"]
 
-DRAW_BATCHES = [
-    "0-49",
-    "50-99",
-]
-
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
 def parse_task_name(df: pd.DataFrame) -> pd.DataFrame:
     # Split the task_name into components
@@ -112,68 +107,60 @@ def assign_run_time(row: pd.Series) -> pd.Series:
 
     return row
 
-# Read in paths
-meta_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/level_4_task_assignments.csv")
-meta_df = meta_df.drop(columns=["task_id", "draw"]).drop_duplicates()
-# replace nan with NA
-meta_df = meta_df.fillna("NA")
+# # Read in paths
+# meta_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/level_4_task_assignments.csv")
+# meta_df = meta_df.drop(columns=["task_id", "draw"]).drop_duplicates()
+# # replace nan with NA
+# meta_df = meta_df.fillna("NA")
 
-# Normalize column names
-meta_df = meta_df.rename(columns={
-    "model": "source_id",
-    "variant": "variant_label",
-    "scenario": "experiment_id",
-    "time_period": "batch_year",
-})
-
-
-# subset to test
-source_id = "MRI-ESM2-0"
-variant_label = "r1i1p1f1"
-experiment_id = "historical"
-batch_year = "2011-2014"
-basin = "WP"
-meta_df = meta_df[
-    (meta_df["source_id"] == source_id) &
-    (meta_df["variant_label"] == variant_label) &
-    (meta_df["experiment_id"] == experiment_id) &
-    (meta_df["batch_year"] == batch_year) &
-    (meta_df["basin"] == basin)
-].reset_index(drop=True)
+# # Normalize column names
+# meta_df = meta_df.rename(columns={
+#     "model": "source_id",
+#     "variant": "variant_label",
+#     "scenario": "experiment_id",
+#     "time_period": "batch_year",
+# })
 
 
+# # subset to test
+# source_id = "MRI-ESM2-0"
+# variant_label = "r1i1p1f1"
+# experiment_id = "historical"
+# batch_year = "1970-1974"
+# basin = "WP"
+# meta_df = meta_df[
+#     (meta_df["source_id"] == source_id) &
+#     (meta_df["variant_label"] == variant_label) &
+#     (meta_df["experiment_id"] == experiment_id) &
+#     (meta_df["batch_year"] == batch_year) &
+#     (meta_df["basin"] == basin)
+# ].reset_index(drop=True)
 
-# get counts of storms per source_id, variant_label, experiment_id, batch_year, basin
-meta_df_storm_counts = run_storm_count_parallel(meta_df)
+# # get counts of storms per source_id, variant_label, experiment_id, batch_year, basin
+# meta_df_storm_counts = run_storm_count_parallel(meta_df)
 
-# read in storm draws
-storm_draw_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/storm_draw_table.csv")
+# # read in storm draws
+# storm_draw_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/storm_draw_table.csv")
 
-complete_df = meta_df_storm_counts.merge(
-    storm_draw_df,
-    on=["source_id", "variant_label",],
-    how="inner",
-)
+# complete_df = meta_df_storm_counts.merge(
+#     storm_draw_df,
+#     on=["source_id", "variant_label",],
+#     how="inner",
+# )
 
-# replace storm_draw as storm_draw_XXXX
-complete_df["storm_draw"] = complete_df["storm_draw"].apply(lambda x: f"storm_draw_{x:04d}")
+# # replace storm_draw as storm_draw_XXXX
+# complete_df["storm_draw"] = complete_df["storm_draw"].apply(lambda x: f"storm_draw_{x:04d}")
 
-# Assign run times based on storm counts
-meta_df_storm_counts = complete_df.apply(assign_run_time, axis=1)
+# # Assign run times based on storm counts
+# meta_df_storm_counts = complete_df.apply(assign_run_time, axis=1)
 
-# take first storm_draw for testing
-storm_draws = meta_df_storm_counts["storm_draw"].unique()
-first_draw = storm_draws[0]
 
-# Create full tasks by cross-joining with draw batches
-full_tasks_df = (
-    meta_df_storm_counts
-    .assign(key=1)
-    .merge(pd.DataFrame({"draw_batch": DRAW_BATCHES, "key": 1}), on="key")
-    .drop(columns=["key"])
-)
 
-full_tasks_df = full_tasks_df[full_tasks_df["storm_draw"] == first_draw].reset_index(drop=True)
+full_tasks_df = pd.read_csv("/mnt/share/homes/mfiking/downloads/stage1_test_cases.csv")
+# fill na with NA
+full_tasks_df = full_tasks_df.fillna("NA")
+
+
 
 user = getpass.getuser()
 
@@ -237,10 +224,9 @@ for _, config in unique_configs.iterrows():
             "--basin {basin} "
             "--relative_risk {relative_risk} "
             "--sample_name {sample_name} "
-            "--draw_batch {draw_batch} "
             "--num_cores {num_cores}"
         ),
-        node_args=["storm_draw", "source_id", "variant_label", "experiment_id", "batch_year", "basin", "relative_risk", "sample_name", "draw_batch", "num_cores"],
+        node_args=["storm_draw", "source_id", "variant_label", "experiment_id", "batch_year", "basin", "relative_risk", "sample_name", "num_cores"],
         task_args=[],
         op_args=[],
     )
@@ -259,7 +245,7 @@ for row in full_tasks_df.itertuples():
         else:
             raise ValueError(f"Unexpected relative risk type: {relative_risk}")
         task = template.create_task(
-            name=f"CLIMADA_stage1_{row.storm_draw}_{row.source_id}_{row.variant_label}_{row.experiment_id}_{row.batch_year}_{row.basin}_{relative_risk}_{sample_name}_d{row.draw_batch}_c{row.num_cores}",
+            name=f"CLIMADA_stage1_{row.storm_draw}_{row.source_id}_{row.variant_label}_{row.experiment_id}_{row.batch_year}_{row.basin}_{relative_risk}_{sample_name}_c{row.num_cores}",
             storm_draw=row.storm_draw,
             source_id=row.source_id,
             variant_label=row.variant_label,
@@ -268,7 +254,6 @@ for row in full_tasks_df.itertuples():
             basin=row.basin,
             relative_risk=relative_risk,
             sample_name=sample_name,
-            draw_batch=row.draw_batch,
             num_cores=row.num_cores,
         )
         tasks.append(task)
