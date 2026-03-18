@@ -45,10 +45,10 @@ num_cores = args.num_cores
 
 # Constants
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage0_sample_02_25_26")
-LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage0_log_sample_02_25_26/") # TEST
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1")
+LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_log/") # TEST
 RESOLUTION = 0.1  # degrees
-GDF_PATH = Path("/mnt/team/rapidresponse/pub/population-model/admin-inputs/raking/gbd-inputs/shapes_gbd_2021.parquet")
+GDF_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84.parquet")
 
 ######################################
 #        Read in Tracks              #
@@ -219,7 +219,16 @@ def chmod_recursive(path: Path, mode: int = 0o775):
         for f in files:
             os.chmod(os.path.join(root, f), mode)
 
+def ensure_min_grid(da: xr.DataArray, buffer_deg: float = 0.1) -> xr.DataArray:
+    if da.lat.size == 1:
+        c = float(da.lat.values[0])
+        da = da.reindex(lat=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
 
+    if da.lon.size == 1:
+        c = float(da.lon.values[0])
+        da = da.reindex(lon=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
+
+    return da
 
 #####################################
 #    Basin Centroid Functions        #
@@ -473,9 +482,6 @@ def compute_yearly_exposure_per_storm(
             name="exposure_hours",
         )
         empty_da.attrs.update(yearly_exposure.attrs)
-        # Only normalize longitude, skip cropping
-        lon_180 = ((empty_da["lon"].values + 180) % 360) - 180
-        empty_da = empty_da.assign_coords(lon=lon_180).sortby("lon")
         return empty_da
 
     # ---- For valid storms ----
@@ -484,30 +490,12 @@ def compute_yearly_exposure_per_storm(
     yearly_exposure = yearly_exposure.dropna(dim="lat", how="all")
     yearly_exposure = yearly_exposure.dropna(dim="lon", how="all")
 
-    BUFFER = 0.1
 
     # --------------------------------------------------
     # Expand single-pixel footprint by creating new grid
     # --------------------------------------------------
-    if yearly_exposure.lat.size == 1:
-        center = float(yearly_exposure.lat.values[0])
-        new_lat = np.array([center - BUFFER, center, center + BUFFER])
-        yearly_exposure = yearly_exposure.reindex(lat=new_lat, fill_value=0)
+    yearly_exposure = ensure_min_grid(yearly_exposure)
 
-    if yearly_exposure.lon.size == 1:
-        center = float(yearly_exposure.lon.values[0])
-        new_lon = np.array([center - BUFFER, center, center + BUFFER])
-        yearly_exposure = yearly_exposure.reindex(lon=new_lon, fill_value=0)
-
-    # ---- Normalize longitude to -180..180 ----
-    lon_vals = yearly_exposure["lon"].values
-    lon_180 = ((lon_vals + 180) % 360) - 180
-    yearly_exposure = yearly_exposure.assign_coords(lon=lon_180)
-    yearly_exposure = yearly_exposure.sortby("lon")
-
-    # ---- Fill remaining NaNs with zeros ----
-    yearly_exposure = yearly_exposure.fillna(0)
-    
     return yearly_exposure
 
 
@@ -598,31 +586,17 @@ def generate_intensity_per_storm(
             name=f"{storm_name}_intensity",
         )
         empty_da.attrs.update(da.attrs)
-        # Only normalize longitude, skip dropping zeros
-        lon_180 = ((lon + 180) % 360) - 180
-        empty_da = empty_da.assign_coords(lon=lon_180).sortby("lon")
         return empty_da
-
-    BUFFER = 0.1
+    
+    # ---- Crop to storm footprint in 0–360 ----
+    da = da.where(da > 0)
+    da = da.dropna(dim="lat", how="all")
+    da = da.dropna(dim="lon", how="all")
 
     # --------------------------------------------------
     # Expand single-pixel footprint by creating new grid
     # --------------------------------------------------
-    if da.lat.size == 1:
-        center = float(da.lat.values[0])
-        new_lat = np.array([center - BUFFER, center, center + BUFFER])
-        da = da.reindex(lat=new_lat, fill_value=0)
-
-    if da.lon.size == 1:
-        center = float(da.lon.values[0])
-        new_lon = np.array([center - BUFFER, center, center + BUFFER])
-        da = da.reindex(lon=new_lon, fill_value=0)
-
-    # ---- Normalize longitude to -180..180 ----
-    lon_vals = da["lon"].values.astype("float32")
-    lon_180 = ((lon_vals + 180) % 360) - 180
-    da = da.assign_coords(lon=lon_180)
-    da = da.sortby("lon")
+    da = ensure_min_grid(da)
 
     return da
 
@@ -731,8 +705,6 @@ def get_storm_indices(ds_all: xr.Dataset) -> list[int]:
     return valid_indices
 
 
-
-
 def sanitize_attrs(attrs: dict) -> dict:
     """
     Recursively sanitize a dictionary of attributes to be Zarr v3 compatible.
@@ -767,45 +739,44 @@ def sanitize_attrs(attrs: dict) -> dict:
 #     Check Landfall Functions          #
 #########################################
 
-def load_land_polygons_for_storm(storm_da, shapefile_gdf_path: str, buffer: float = 5.0) -> gpd.GeoDataFrame:
+def load_land_polygons_for_storm(
+    storm_da,
+    shapefile_gdf_path: str,
+    buffer: float = 2.0,
+) -> gpd.GeoDataFrame:
     """
-    Load land polygons that intersect the bounding box of the storm intensity.
-
-    Parameters
-    ----------
-    storm_da : xr.DataArray
-        Storm intensity DataArray (lat/lon) already normalized to -180..180
-        and cropped around the storm footprint.
-    shapefile_gdf_path : str
-        Path to the land polygons parquet file (WGS84, -180..180)
-    buffer : float
-        Degrees to expand around storm bounding box.
-
-    Returns
-    -------
-    gpd.GeoDataFrame
-        Land polygons intersecting the storm + buffer.
+    Load land polygons intersecting storm bounding box (0–360 longitude space).
     """
 
-    # ---- Compute bounding box around storm + buffer ----
     min_lon = float(storm_da["lon"].min()) - buffer
     max_lon = float(storm_da["lon"].max()) + buffer
     min_lat = float(storm_da["lat"].min()) - buffer
     max_lat = float(storm_da["lat"].max()) + buffer
 
-    # ---- Load shapefile (no initial bbox filtering) ----
     gdf = gpd.read_parquet(shapefile_gdf_path)
 
-    # ---- Subset polygons that intersect the storm bounding box ----
-    storms_bbox_gdf = gpd.GeoDataFrame(
-        geometry=[box(min_lon, min_lat, max_lon, max_lat)],
-        crs=gdf.crs
-    )    
+    # --------------------------------------------------
+    # Handle longitude wraparound (0–360 domain)
+    # --------------------------------------------------
+    if min_lon < 0 or max_lon > 360:
+        # wrapped bbox → split into two
+        boxes = []
 
-    gdf_subset = gdf[gdf.intersects(storms_bbox_gdf.iloc[0].geometry)].copy()
+        if min_lon < 0:
+            boxes.append(box(0, min_lat, max_lon, max_lat))
+            boxes.append(box(360 + min_lon, min_lat, 360, max_lat))
 
-    # clip to exact storm bbox for efficiency in later processing
-    gdf_subset["geometry"] = gdf_subset.geometry.intersection(storms_bbox_gdf.iloc[0].geometry)
+        elif max_lon > 360:
+            boxes.append(box(min_lon, min_lat, 360, max_lat))
+            boxes.append(box(0, min_lat, max_lon - 360, max_lat))
+
+        bbox_geom = gpd.GeoSeries(boxes, crs=gdf.crs).union_all()
+
+    else:
+        bbox_geom = box(min_lon, min_lat, max_lon, max_lat)
+
+    gdf_subset = gdf[gdf.intersects(bbox_geom)].copy()
+    gdf_subset["geometry"] = gdf_subset.geometry.intersection(bbox_geom)
 
     return gdf_subset
 
@@ -817,17 +788,20 @@ def check_storm_landfall(
     wind_threshold: float = 17.0,
 ) -> bool:
     """
-    True only if storm has winds >= threshold AND those winds intersect land.
+    True only if storm has winds > threshold AND those winds intersect land.
     """
 
     # --- 0. Skip globally weak storms ---
-    max_intensity = float(storm_intensity.max().values)
-    if max_intensity < wind_threshold:
+    if float(storm_intensity.max().values) < wind_threshold:
         return False
 
-    # --- Ensure grid is valid ---
+    # --------------------------------------------------
+    # Expand single-pixel grid so rasterization works
+    # --------------------------------------------------
+    storm_intensity = ensure_min_grid(storm_intensity)
+
+    # --- Verify expansion worked ---
     if storm_intensity.lat.size < 2 or storm_intensity.lon.size < 2:
-        # too small to rasterize safely
         return False
 
     # --- 1. Create transform ---
@@ -863,11 +837,11 @@ def check_storm_landfall(
 
         pixel_buffer_x = int(np.ceil(buffer_km * 1000 / (res_lon * meters_per_deg_lon)))
         pixel_buffer_y = int(np.ceil(buffer_km * 1000 / (res_lat * meters_per_deg_lat)))
-        iterations = max(pixel_buffer_x, pixel_buffer_y)
 
+        iterations = max(pixel_buffer_x, pixel_buffer_y)
         land_raster = binary_dilation(land_raster, iterations=iterations)
 
-    # --- 4. STRONG wind overlap with land ---
+    # --- 4. Strong wind overlap with land ---
     strong_wind_mask = storm_intensity.values > wind_threshold
     land_mask = land_raster.astype(bool)
 

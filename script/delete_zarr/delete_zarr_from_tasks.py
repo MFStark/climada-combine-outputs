@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd  # type: ignore
 import sys
 
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage0_DELETE")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage0_DELETE_02_27")
 metrics = ["days_impact", "intensity", "exposure_hours"]
 
 MAX_WORKERS = 32   # adjust if filesystem struggles

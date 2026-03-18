@@ -10,31 +10,26 @@ from rra_tools.parallel import run_parallel  # type: ignore
 import os
 
 DRAW_BATCHES = [
-# "0-4",
-# "0-0",
-"1-1",
-# "2-2",
-# "3-3",
-# "4-4",
-# "5-9",
-# "10-14",
-# "15-19",
-# "20-24",
-# "25-29",
-# "30-34",
-# "35-39",
-# "40-44",
-# "45-49",
-# "50-54",
-# "55-59",
-# "60-64",
-# "65-69",
-# "70-74",
-# "75-79",
-# "80-84",
-# "85-89",
-# "90-94",
-# "95-99",
+"0-4",
+"5-9",
+"10-14",
+"15-19",
+"20-24",
+"25-29",
+"30-34",
+"35-39",
+"40-44",
+"45-49",
+"50-54",
+"55-59",
+"60-64",
+"65-69",
+"70-74",
+"75-79",
+"80-84",
+"85-89",
+"90-94",
+"95-99",
 ]
 
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
@@ -149,33 +144,9 @@ meta_df = meta_df.rename(columns={
     "time_period": "batch_year",
 })
 
-# test one model 
-source_id = "CMCC-ESM2"
-variant_label = "r1i1p1f1"
-basin = "EP"
-
-meta_df = meta_df[
-    (meta_df["source_id"] == source_id) &
-    (meta_df["variant_label"] == variant_label) 
-]
-historical_df = meta_df[meta_df["batch_year"] == "2011-2014"]
-ssp126_df = meta_df[meta_df["batch_year"] == "2070-2074"]
-ssp245_df = meta_df[meta_df["batch_year"] == "2029-2032"]
-ssp585_df = meta_df[meta_df["batch_year"] == "2046-2048"]
-
-sample_df = pd.concat([historical_df, ssp126_df, ssp245_df, ssp585_df])
-
-# test failed CLIMADA_stage0_CMCC-ESM2_r1i1p1f1_ssp245_2029-2032_NI_d0-4_c5 
-sample_df = sample_df[
-    (sample_df["source_id"] == "CMCC-ESM2") & 
-    (sample_df["variant_label"] == "r1i1p1f1") &
-    (sample_df["experiment_id"] == "ssp245") &
-    (sample_df["batch_year"] == "2029-2032") & 
-    (sample_df["basin"] == "NI")
-]
 
 # get storm counts
-meta_df_storm_counts = run_storm_count_parallel(sample_df)
+meta_df_storm_counts = run_storm_count_parallel(meta_df)
 
 # Assign run times based on storm counts
 meta_df_storm_counts = meta_df_storm_counts.apply(assign_run_time, axis=1)
@@ -188,8 +159,6 @@ full_tasks_df = (
     .drop(columns=["key"])
 )
 
-
-
 user = getpass.getuser()
 
 # Project
@@ -200,12 +169,12 @@ user = getpass.getuser()
 wf_uuid = uuid.uuid4()
 
 # Create a tool
-tool = Tool(name="CLIMADA_stage0")
+tool = Tool(name="CLIMADA_state1")
 
 
 # Create a workflow, and set the executor
 workflow = tool.create_workflow(
-    name=f"CLIMADA_stage0_{wf_uuid}",
+    name=f"CLIMADA_state1_{wf_uuid}",
     # max_concurrently_running = 100,
 )
 
@@ -232,7 +201,7 @@ for _, config in unique_configs.iterrows():
     config_key = f"rt{config['max_run_time']}_c{config['num_cores']}_m{config['memory_req']}"
     
     task_templates[config_key] = tool.get_task_template(
-        template_name=f"CLIMADA_stage0_{config_key}",
+        template_name=f"CLIMADA_state1_{config_key}",
         default_cluster_name="slurm",
         default_compute_resources={
             "queue": "all.q",
@@ -242,7 +211,7 @@ for _, config in unique_configs.iterrows():
             "project": project,
         },
         command_template=(
-            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/00_climada_intensity_main.py "
+            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/01_climada_intensity_main.py "
             "--source_id {source_id} "
             "--variant_label {variant_label} "
             "--experiment_id {experiment_id} "
@@ -263,7 +232,7 @@ for row in full_tasks_df.itertuples():
     template = task_templates[config_key]
     
     task = template.create_task(
-        name=f"CLIMADA_stage0_{row.source_id}_{row.variant_label}_{row.experiment_id}_{row.batch_year}_{row.basin}_d{row.draw_batch}_c{row.num_cores}",
+        name=f"CLIMADA_state1_{row.source_id}_{row.variant_label}_{row.experiment_id}_{row.batch_year}_{row.basin}_d{row.draw_batch}_c{row.num_cores}",
         source_id=row.source_id,
         variant_label=row.variant_label,
         experiment_id=row.experiment_id,
