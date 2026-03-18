@@ -45,8 +45,8 @@ num_cores = args.num_cores
 
 # Constants
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage0")
-LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage0_log/") # TEST
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1")
+LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_log/") # TEST
 RESOLUTION = 0.1  # degrees
 GDF_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84.parquet")
 

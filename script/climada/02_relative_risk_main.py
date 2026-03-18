@@ -18,6 +18,7 @@ import re
 from rra_tools.parallel import run_parallel  # type: ignore
 import time
 from rasterra import RasterArray  # type: ignore
+from typing import NamedTuple
 
 parser = argparse.ArgumentParser(description="Run CLIMADA code")
 
@@ -45,16 +46,47 @@ sample_name = args.sample_name
 num_cores = args.num_cores
 
 # Constants
-ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage0")# TEST
-SAVE_ROOT = Path("/mnt/share/scratch/users/mfiking/outputs/climada/stage1_2_27") # TEST
+ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2")
 
+class StormMeta(NamedTuple):  # type: ignore
+    storm_path: Path
+    start_year: int
+    end_year: int
+    storm_id: str
+
+
+def iter_storms_metadata(draw_store: Path) -> list[StormMeta]:
+    """Return a list of StormMeta for each storm in the draw, without loading full data."""
+    if not draw_store.exists():
+        raise FileNotFoundError(f"Draw store not found: {draw_store}")
+
+    storm_paths = sorted(
+        p for p in draw_store.iterdir() if p.is_dir() and p.name.startswith("storm_")
+    )
+
+    storms_meta = []
+    for storm_path in storm_paths:
+        ds = xr.open_zarr(storm_path, consolidated=False, chunks={})  # lazy read, no load
+        start_year = pd.to_datetime(ds.attrs["start_date"]).year
+        end_year = pd.to_datetime(ds.attrs["end_date"]).year
+        storm_id = ds.attrs.get("storm_id", storm_path.name)
+        storms_meta.append(StormMeta(storm_path, start_year, end_year, storm_id))
+        ds.close()  # close immediately to avoid keeping file handles open
+    return storms_meta
+
+def map_storms_to_years(storms_meta: list[StormMeta], years: list[int]):
+    storms_by_year = {year: [] for year in years}
+    for storm in storms_meta:
+        for year in range(storm.start_year, storm.end_year + 1):
+            if year in storms_by_year:
+                storms_by_year[year].append(storm.storm_path)
+    return storms_by_year
+
+    
 ##########################################
 #          Helper Functions              #
 ##########################################
-def to_numpy(x, template):
-    if x is None:
-        return np.zeros_like(template._ndarray, dtype=np.float32)
-    return x.compute() if hasattr(x, "compute") else x
 
 def chmod_recursive(path: Path, mode: int = 0o775):
     for root, dirs, files in os.walk(path):
@@ -240,7 +272,7 @@ def storm_primary_year(storm_ds: xr.Dataset) -> int:
     """
     return pd.to_datetime(storm_ds.attrs["start_date"]).year
 
-def generate_basin_template_raster(basin, res=0.1, buffer_deg=0.0):
+def generate_basin_template_raster(basin, res=0.1, buffer_deg=5.0):
     basin_bounds = {
         'EP': ['180E', '0N', '290E', '60N'],
         'NA': ['260E', '0N', '360E', '60N'],
@@ -280,12 +312,12 @@ def generate_basin_template_raster(basin, res=0.1, buffer_deg=0.0):
     transform = Affine(res, 0, lon_min, 0, -res, lat_max)
 
     # Wrap as RasterArray
+    # Wrap as RasterArray
     raster = RasterArray(data=data,
                          transform=transform,
                          crs="EPSG:4326",
                          no_data_value=np.nan
                          )
-
     return raster
 
 ##########################################
@@ -519,7 +551,6 @@ def save_raster(
     batch_year: str,
     basin: str,
     year: int,
-    tc_risk_draw: int,
     metric: str,  # "raw_paf" or "raw_rr"
     save_root: Path = SAVE_ROOT,
     max_retries: int = 3,
@@ -536,19 +567,17 @@ def save_raster(
         Raster template to copy CRS, transform, and no_data_value.
     metric : str
         Metric name, e.g., "raw_paf" or "raw_rr".
-    tc_risk_draw : int
-        Draw index (used for filename suffix).
+
     """
     raster_data = raster_data.astype(np.float32)
 
     save_dir = save_root / storm_draw / source_id / variant_label / experiment_id / batch_year / str(year) / basin / metric
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    draw_text = "" if tc_risk_draw == 0 else f"_e{tc_risk_draw - 1}"
     start_year, end_year = batch_year.split("-")
     filename = (
         f"draw_mean_{metric}_{storm_draw}_{relative_risk}_{sample_name}_{basin}_{source_id}_"
-        f"{experiment_id}_{variant_label}_{start_year}01_{end_year}12_{year}{draw_text}.tif"
+        f"{experiment_id}_{variant_label}_{start_year}01_{end_year}12_{year}.tif"
     )
     save_path = save_dir / filename
 
@@ -587,7 +616,7 @@ def save_raster(
 def process_single_draw(draw):
     """
     Process a single draw of storms and return yearly raw PAF and yearly RR rasters.
-    Accepts a precomputed basin-wide template raster for cumulative arrays.
+    Uses storm metadata to avoid loading full datasets until necessary.
     """
     (
         storm_draw,
@@ -599,9 +628,14 @@ def process_single_draw(draw):
         draw,
         relative_risk,
         sample_name,
-        template_raster,  # new argument
+        template_raster,
+        rr_samples_df,
     ) = draw
 
+    # Create template raster for this basin
+    # template_raster = generate_basin_template_raster(basin, res=0.1)
+
+    # Path to the intensity draw
     intensity_draw_store = get_draw_zarr_path(
         source_id=source_id,
         variant_label=variant_label,
@@ -611,70 +645,59 @@ def process_single_draw(draw):
         draw=draw,
         metric="intensity",
     )
-    print(f"intensity_draw: {intensity_draw_store}")
+    # print(f"intensity_draw: {intensity_draw_store}")
+
+    # Year range for the batch
     start_year, end_year = map(int, batch_year.split("-"))
-    all_years = list(range(start_year, end_year + 1)
-                     )
-    # If intensity data is missing, return empty rasters
-    if intensity_draw_store is None or not any(iter_storms_from_draw(intensity_draw_store)):
+    all_years = list(range(start_year, end_year + 1))
+
+    # If no intensity data exists, return empty rasters
+    if intensity_draw_store is None or not any(intensity_draw_store.iterdir()):
         yearly_paf = {year: np.zeros_like(template_raster._ndarray, dtype=np.float32) for year in all_years}
-        yearly_rr = {year: np.ones_like(template_raster._ndarray, dtype=np.float32) for year in all_years}
         print(f"⚠️ Draw {draw} has no intensity data. Returning empty rasters for basin {basin}, batch {batch_year}")
-        return yearly_paf, yearly_rr, template_raster
+        return yearly_paf
 
 
-    rr_samples_df = load_relative_risk_df(relative_risk=relative_risk)
 
-    # Initialize dictionaries for yearly rasters
-
+    # Initialize output dictionaries
     yearly_paf = {}
-    yearly_rr = {}
 
-    storms = list(iter_storms_from_draw(intensity_draw_store))
-    storms_by_year = {year: [] for year in all_years}
+    # --- STEP 1: Get metadata for all storms in the draw ---
+    storms_meta = iter_storms_metadata(intensity_draw_store)  # returns list of StormMeta
+    storms_by_year = map_storms_to_years(storms_meta, all_years)
 
-    for storm_ds in storms:
-        start_year_storm = pd.to_datetime(storm_ds.attrs["start_date"]).year
-        end_year_storm = pd.to_datetime(storm_ds.attrs["end_date"]).year
-
-        for year in range(start_year_storm, end_year_storm + 1):
-            if year in storms_by_year:
-                storms_by_year[year].append(storm_ds)
-
-        
+    # --- STEP 2: Process each year individually ---
     for year in all_years:
-        print(f"processing year: {year}")
+        # print(f"Processing year: {year}")
+        storm_paths_in_year = storms_by_year[year]
 
-        storms_in_year = storms_by_year[year]
-
-        # ✅ Skip year if no storms and return empty rasters
-        if not storms_in_year:
+        # Skip years with no storms
+        if not storm_paths_in_year:
             yearly_paf[year] = np.zeros_like(template_raster._ndarray, dtype=np.float32)
-            yearly_rr[year] = np.ones_like(template_raster._ndarray, dtype=np.float32)
             continue
 
-        # Initialize cumulative arrays ONLY when storms exist
-        one_minus_raw_paf = np.ones(template_raster._ndarray.shape, dtype=np.float32)
-        rr_weighted_sum = np.zeros_like(template_raster._ndarray, dtype=np.float32)
-        n_storms = np.zeros_like(template_raster._ndarray, dtype=np.int16)
+        # Initialize cumulative arrays for this year
+        sum_raw_paf = np.zeros_like(template_raster._ndarray, dtype=np.float32)
 
-        storms_in_year = sorted(
-            storms_in_year,
-            key=lambda ds: pd.to_datetime(ds.attrs["start_date"])
-        )
+        # Sort storms by start date (optional)
+        # storm_paths_in_year = sorted(
+        #     storm_paths_in_year,
+        #     key=lambda p: pd.to_datetime(xr.open_zarr(p, consolidated=False, chunks={}).attrs["start_date"])
+        # )
 
-        for storm_ds in storms_in_year:
-            storm_id = storm_ds.attrs.get("storm_id")
+        # --- STEP 3: Process each storm ---
+        for storm_path in storm_paths_in_year:
+            # Open storm lazily
+            storm_ds = xr.open_zarr(storm_path, consolidated=False, chunks="auto")
+            storm_id = storm_ds.attrs.get("storm_id", storm_path.name)
+            # print(f"Storm: {storm_id}")
 
-            # ------------------------------
-            # Compute relative risk
-            # ------------------------------
+            # Compute RR and days impact
             rr_da = generate_relative_risk(
                 da_intensity=storm_ds["intensity"],
                 rr_samples_df=rr_samples_df,
                 sample_name=sample_name,
             )
-
             storm_rr = to_raster(
                 ds=rr_da,
                 no_data_value=np.nan,
@@ -682,12 +705,8 @@ def process_single_draw(draw):
                 lon_col="lon",
                 crs="EPSG:4326"
             ).resample_to(target=template_raster, resampling="nearest")
+            rr_values = storm_rr._ndarray
 
-            rr_values = np.asarray(storm_rr._ndarray)
-
-            # ------------------------------
-            # Generate days impact
-            # ------------------------------
             storm_days_impact = to_raster(
                 ds=generate_days_impact_from_intensity(storm_ds["intensity"], impact_days=20.0),
                 no_data_value=0,
@@ -695,41 +714,33 @@ def process_single_draw(draw):
                 lon_col="lon",
                 crs="EPSG:4326"
             ).resample_to(target=template_raster, resampling="nearest")
-
-            t_impact = np.asarray(storm_days_impact._ndarray)
+            t_impact = storm_days_impact._ndarray
 
             # Mask valid pixels
             mask = np.isfinite(t_impact) & np.isfinite(rr_values) & (t_impact > 0) & (rr_values != 0)
-
             if not mask.any():
-                print(f"⚠️ Storm {storm_id} has no valid impacted pixels. Skipping...")
+                del storm_rr, storm_days_impact, rr_values, t_impact, mask
+                storm_ds.close()
+                del storm_ds
                 continue
 
-            paf_raw = np.zeros_like(t_impact, dtype=np.float32)
-            paf_raw[mask] = (rr_values[mask] - 1) / rr_values[mask] * (t_impact[mask] / 365)
+            # Compute raw PAF
+            sum_raw_paf[mask] += (rr_values[mask] - 1) / rr_values[mask] * (t_impact[mask] / 365)
 
-            one_minus_raw_paf[mask] *= 1 - paf_raw[mask]
-
-            rr_storm = np.ones_like(rr_values, dtype=np.float32)
-            rr_storm[mask] = rr_values[mask]
-            rr_weighted_sum = da.where(mask, rr_weighted_sum + (rr_storm - 1), rr_weighted_sum)
-            n_storms = da.where(mask, n_storms + 1, n_storms)
-
-            # Clean up memory
-            del storm_rr, storm_days_impact, paf_raw, rr_storm, t_impact, mask
-            gc.collect()
+            # Clean up
+            del storm_rr, storm_days_impact, t_impact, mask, rr_values
+            storm_ds.close()
+            del storm_ds
 
         # End of year calculations
-        yearly_paf[year] = 1 - one_minus_raw_paf
-        yearly_rr[year] = da.where(n_storms > 0, rr_weighted_sum - (n_storms - 1), 1.0)
+        yearly_paf[year] = sum_raw_paf
 
         # Clean up
-        del one_minus_raw_paf, rr_weighted_sum, n_storms
+        del sum_raw_paf
         gc.collect()
 
     print(f"Completed draw {draw} for basin {basin}, batch {batch_year}")
-    return yearly_paf, yearly_rr, template_raster
-
+    return yearly_paf
 
 def main(
     storm_draw: str,
@@ -743,26 +754,26 @@ def main(
     num_cores: int,
     save_root: Path = SAVE_ROOT,
 ):
-    draws = list(range(0, 9))  # or 100 draws if you like
+    draws = list(range(100))
 
-    # Define batch size (10 draws at a time)
-    batch_size = 10
+    # Define batch size based on number of cores
+    batch_size = num_cores
 
     start_year, end_year = map(int, batch_year.split("-"))
-    n_years = end_year - start_year + 1
     all_years = list(range(start_year, end_year + 1))
 
     # Generate basin-wide template raster once
     template_raster = generate_basin_template_raster(basin, res=0.1)
+    # Load relative risk table
+    rr_samples_df = load_relative_risk_df(relative_risk=relative_risk)
 
     # Initialize cumulative dictionaries to hold sums across draws
     cumulative_paf = {year: np.zeros_like(template_raster._ndarray, dtype=np.float32) for year in all_years}
-    cumulative_rr = {year: np.zeros_like(template_raster._ndarray, dtype=np.float32) for year in all_years}
 
     for batch_start in range(0, len(draws), batch_size):
         batch_draws = draws[batch_start: batch_start + batch_size]
         print(f"Starting batch {batch_draws}")
-
+        
         # Prepare arguments for process_single_draw
         draw_args = [
             (
@@ -775,7 +786,8 @@ def main(
                 draw,
                 relative_risk,
                 sample_name,
-                template_raster,  # pass basin template here
+                template_raster,
+                rr_samples_df,
             )
             for draw in batch_draws
         ]
@@ -786,48 +798,45 @@ def main(
             arg_list=draw_args,
             num_cores=num_cores,
         )
+        print(f"Parallel job stage done for draw_batch: {batch_draws}")
 
-        # batch_results is a list of tuples: (yearly_paf_dict, yearly_rr_dict, template_raster) per draw
-        for draw_yearly_paf, draw_yearly_rr, _ in batch_results:
-
+        # # batch_results is a list of yearly_paf dictionaries returned from each draw
+        for draw_yearly_paf in batch_results:
             for year in all_years:
-                arr_rr = to_numpy(draw_yearly_rr.get(year), template_raster)
-                arr_paf = to_numpy(draw_yearly_paf.get(year), template_raster)
-
-                cumulative_rr[year] += arr_rr
-                cumulative_paf[year] += arr_paf
+                arr = draw_yearly_paf.get(year)
+                if arr is not None:
+                    cumulative_paf[year] += arr
 
     # After summing all draws, take the average
     n_draws = len(draws)
     final_paf = {year: arr / n_draws for year, arr in cumulative_paf.items()}
-    final_rr = {year: arr / n_draws for year, arr in cumulative_rr.items()}
 
-    # Save to disk per year & metric
-    metrics = ["raw_paf", "raw_rr"]
+    # Save to disk per year
     for year in all_years:
-        for metric, arr in zip(metrics, [final_paf[year], final_rr[year]]):
-            save_raster(
-                raster_data=arr,
-                template_raster=template_raster,
-                storm_draw=storm_draw,
-                source_id=source_id,
-                variant_label=variant_label,
-                sample_name=sample_name,
-                relative_risk=relative_risk,
-                experiment_id=experiment_id,
-                batch_year=batch_year,
-                basin=basin,
-                year=year,
-                tc_risk_draw=0,  # aggregate, or optional per-draw
-                metric=metric,
-                save_root=save_root,
-            )
+        arr = final_paf[year]
 
-            # Fix permissions
-            out_path = save_root / storm_draw / source_id / variant_label / experiment_id / batch_year / str(year) / basin / metric
-            chmod_recursive(out_path, mode=0o775)
+        save_raster(
+            raster_data=arr,
+            template_raster=template_raster,
+            storm_draw=storm_draw,
+            source_id=source_id,
+            variant_label=variant_label,
+            sample_name=sample_name,
+            relative_risk=relative_risk,
+            experiment_id=experiment_id,
+            batch_year=batch_year,
+            basin=basin,
+            year=year,
+            metric="raw_paf",
+            save_root=save_root,
+        )
+
+        # Fix permissions
+        out_path = save_root / storm_draw / source_id / variant_label / experiment_id / batch_year / str(year) / basin / "raw_paf"
+        chmod_recursive(out_path, mode=0o775)
 
     print(f"Completed all draws for basin {basin}, batch {batch_year}")
+
 
 main(
     storm_draw=storm_draw,

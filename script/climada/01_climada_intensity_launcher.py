@@ -169,12 +169,12 @@ user = getpass.getuser()
 wf_uuid = uuid.uuid4()
 
 # Create a tool
-tool = Tool(name="CLIMADA_stage0")
+tool = Tool(name="CLIMADA_state1")
 
 
 # Create a workflow, and set the executor
 workflow = tool.create_workflow(
-    name=f"CLIMADA_stage0_{wf_uuid}",
+    name=f"CLIMADA_state1_{wf_uuid}",
     # max_concurrently_running = 100,
 )
 
@@ -201,7 +201,7 @@ for _, config in unique_configs.iterrows():
     config_key = f"rt{config['max_run_time']}_c{config['num_cores']}_m{config['memory_req']}"
     
     task_templates[config_key] = tool.get_task_template(
-        template_name=f"CLIMADA_stage0_{config_key}",
+        template_name=f"CLIMADA_state1_{config_key}",
         default_cluster_name="slurm",
         default_compute_resources={
             "queue": "all.q",
@@ -211,7 +211,7 @@ for _, config in unique_configs.iterrows():
             "project": project,
         },
         command_template=(
-            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/00_climada_intensity_main.py "
+            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/01_climada_intensity_main.py "
             "--source_id {source_id} "
             "--variant_label {variant_label} "
             "--experiment_id {experiment_id} "
@@ -232,7 +232,7 @@ for row in full_tasks_df.itertuples():
     template = task_templates[config_key]
     
     task = template.create_task(
-        name=f"CLIMADA_stage0_{row.source_id}_{row.variant_label}_{row.experiment_id}_{row.batch_year}_{row.basin}_d{row.draw_batch}_c{row.num_cores}",
+        name=f"CLIMADA_state1_{row.source_id}_{row.variant_label}_{row.experiment_id}_{row.batch_year}_{row.basin}_d{row.draw_batch}_c{row.num_cores}",
         source_id=row.source_id,
         variant_label=row.variant_label,
         experiment_id=row.experiment_id,
