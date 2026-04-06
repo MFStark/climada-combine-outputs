@@ -132,12 +132,14 @@ full_tasks = (meta_df
 
 
 # subset to one model for testing
+# source_id = "EC-Earth3"
+# variant_label = "r1i1p1f1"
 source_id = "MRI-ESM2-0"
-variant_label = ["r3i1p1f1", "r4i1p1f1", "r5i1p1f1"]
+variant_label = "r2i1p1f1"
 
 full_tasks = full_tasks[
     (full_tasks["source_id"] == source_id) &
-    (full_tasks["variant_label"].isin(variant_label))
+    (full_tasks["variant_label"] == variant_label)
 ].reset_index(drop=True)
 
 # chnage min run time to 60m for testing
@@ -147,51 +149,52 @@ full_tasks["req_runtime_min"] = 30.0
 full_tasks["memory_req"] = "50G"
 
 ##########################################################
-# workflow_id1 = 561974
-# workflow_id2 = 562138
+workflow_id1 = 562139
+workflow_id2 = 562141
+workflow_id3 = 562224
 
 
-# workflow_ids = [workflow_id1, workflow_id2]
+workflow_ids = [workflow_id1, workflow_id2, workflow_id3]
 
-# total_df_list = []
+total_df_list = []
 
-# for workflow_id in workflow_ids:
-#     df = workflow_tasks(
-#         workflow_id=workflow_id,
-#         limit=-1   # return all tasks
-#     )
-#     completed_df = df[df["STATUS"] == "D"]
-#     total_df_list.append(completed_df)
-
-
-# total_df = pd.concat(total_df_list, ignore_index=True)
-
-# # Create completed parameters df
-# parts = total_df["TASK_NAME"].str.split("_", expand=True)
+for workflow_id in workflow_ids:
+    df = workflow_tasks(
+        workflow_id=workflow_id,
+        limit=-1   # return all tasks
+    )
+    completed_df = df[df["STATUS"] == "D"]
+    total_df_list.append(completed_df)
 
 
+total_df = pd.concat(total_df_list, ignore_index=True)
 
-# complete_parameters = pd.DataFrame({
-#     "source_id": parts[2].str.removeprefix("src"),
-#     "variant_label": parts[3].str.removeprefix("var"),
-#     "experiment_id": parts[4].str.removeprefix("exp"),
-#     "batch_year": parts[5].str.removeprefix("yr"),
-#     "basin": parts[6],
-#     "draw_batch": parts[10].str.removeprefix("db"),
-# })
-
-
-# complete_parameters = complete_parameters.merge(full_tasks, on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="inner")
-
-
-# # drop complete parameters from full tasks to get remaining tasks
-
-# remaining_meta = full_tasks.merge(complete_parameters[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]], on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="left", indicator=True)
-# remaining_meta = remaining_meta[remaining_meta["_merge"] == "left_only"].drop(columns=["_merge"])
+# Create completed parameters df
+parts = total_df["TASK_NAME"].str.split("_", expand=True)
 
 
 
-# full_tasks = remaining_meta.copy()
+complete_parameters = pd.DataFrame({
+    "source_id": parts[2].str.removeprefix("src"),
+    "variant_label": parts[3].str.removeprefix("var"),
+    "experiment_id": parts[4].str.removeprefix("exp"),
+    "batch_year": parts[5].str.removeprefix("yr"),
+    "basin": parts[6],
+    "draw_batch": parts[10].str.removeprefix("db"),
+})
+
+
+complete_parameters = complete_parameters.merge(full_tasks, on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="inner")
+
+
+# drop complete parameters from full tasks to get remaining tasks
+
+remaining_meta = full_tasks.merge(complete_parameters[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]], on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="left", indicator=True)
+remaining_meta = remaining_meta[remaining_meta["_merge"] == "left_only"].drop(columns=["_merge"])
+
+
+
+full_tasks = remaining_meta.copy()
 
 
 #######################################################################
@@ -251,7 +254,7 @@ for _, config in unique_configs.iterrows():
             "memory": lambda x: int(x*1.5),  # scale memory by 50%
             "runtime": lambda x: int(x*2),  # scale runtime by 100%
         },
-        max_attempts=7,
+        max_attempts=5,
         command_template=(
             "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/04_admin_level_exposure_main_04_02_26.py "
             "--source_id {source_id} "

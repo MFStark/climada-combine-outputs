@@ -1215,25 +1215,11 @@ def process_single_draw(args):
                 exposure_raster = clean_raster(exposure_raster)
             except ValueError:
                 print("No affected pixels found in exposure raster → skipping storm")
+                del intensity_raster, exposure_raster
+                gc.collect()
+                continue
 
             # print(f"Rasters Cleaned")
-
-            # ---------------------------------------------------
-            # Pixel diagnostics (after clean_raster)
-            # ---------------------------------------------------
-            arr = intensity_raster._ndarray
-            total_pixels = arr.size
-            affected_pixels = np.isfinite(arr).sum()
-            percent_affected = (affected_pixels / total_pixels) * 100
-
-            # print(
-            #     f"Total pixels: {total_pixels}, "
-            #     f"Affected pixels: {affected_pixels}, "
-            #     f"Percent affected: {percent_affected:.2f}%"
-            # )
-
-            low_coverage = percent_affected < 0.75
-
 
             # ---------------------------------------------------
             # Subset admin shapes intersecting storm
@@ -1290,135 +1276,117 @@ def process_single_draw(args):
             for _, admin_shape in intersected_shapes.iterrows():
                 admin_geom = admin_shape.geometry
                 admin_id = admin_shape["loc_id"]
-
                 print(f"Processing admin id: {admin_id}")
 
                 max_wind_speed = max_wind_by_loc.get(admin_id, np.nan)
+
                 if not np.isfinite(max_wind_speed):
                     print(f"⚠️ Max wind speed is NaN for admin_id={admin_id} → skipping admin")
-                    continue
+                    continue  # skip this admin entirely
 
-                # -----------------------------------------
-                # Population (compute once per admin)
-                # -----------------------------------------
+
+                geom_pieces_cea, geom_pieces_wgs84 = split_antimeridian_geom(admin_geom)
+                if not geom_pieces_cea:
+                    geom_pieces_cea = [admin_geom]
+                    geom_pieces_wgs84 = [gpd.GeoSeries([admin_geom], crs="ESRI:54034").to_crs("EPSG:4326").iloc[0]]
+
+                # print(f"Split into {len(geom_pieces_cea)} pieces after antimeridian check")
+
+                person_storm_hours_total = 0.0
+                population_exposed_total = 0.0
+
                 pop_sum, special_region_flag = get_population_total(
                     pop_df=pop_df,
                     year=year,
                     admin_id=admin_id,
                 )
 
-                # -----------------------------------------
-                # Geometry handling
-                # -----------------------------------------
-                if low_coverage and isinstance(admin_geom, MultiPolygon):
-                    geom_list = list(admin_geom.geoms)
-                    print(f"[LOW] Exploding MultiPolygon → {len(geom_list)} pieces")
-                else:
-                    geom_list = [admin_geom]
-
-                # -----------------------------------------
-                # Accumulators (per admin)
-                # -----------------------------------------
-                person_storm_hours_total = 0.0
-                population_exposed_total = 0.0
-
-                # -----------------------------------------
-                # Process each geometry (piece or whole)
-                # -----------------------------------------
-                for geom in geom_list:
-
-                    geom_pieces_cea, geom_pieces_wgs84 = split_antimeridian_geom(geom)
-                    if not geom_pieces_cea:
-                        geom_pieces_cea = [geom]
-                        geom_pieces_wgs84 = [gpd.GeoSeries([geom], crs="ESRI:54034").to_crs("EPSG:4326").iloc[0]]
-
-                    for piece_cea, piece_wgs84 in zip(geom_pieces_cea, geom_pieces_wgs84):
-
-                        if basin != "NA":
-                            piece_wgs84 = normalize_geom_to_0_360(piece_wgs84)
-
-                        try:
-                            admin_exposure = (
-                                exposure_raster
-                                .clip(piece_wgs84)
-                                .mask(piece_wgs84, all_touched=True)
-                            )
-                        except rasterio.errors.WindowError:
-                            continue
-
-                        # -----------------------
-                        # Bounds → population
-                        # -----------------------
-                        minx, maxx, miny, maxy = admin_exposure.bounds
-                        buffer = 0.2
-                        raster_bounds = box(minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
-
-                        intersection = piece_wgs84.intersection(raster_bounds)
-                        intersection_cea = (
-                            gpd.GeoSeries([intersection], crs="EPSG:4326")
-                            .to_crs("ESRI:54034")
-                            .iloc[0]
+                for piece_cea, piece_wgs84 in zip(geom_pieces_cea, geom_pieces_wgs84):   
+                    if basin != "NA":                 
+                        piece_wgs84 = normalize_geom_to_0_360(piece_wgs84)
+                    try:
+                        admin_exposure = (
+                            exposure_raster
+                            .clip(piece_wgs84)
+                            .mask(piece_wgs84, all_touched=True)
                         )
-
-                        # ----------------------------
-                        # Load population
-                        # ----------------------------
-                        try:
-                            pop_piece = load_in_gridded_population(year, 100, bounds=intersection_cea.bounds)
-                            pop_piece_masked = pop_piece.mask(piece_cea, all_touched=True)
-                        except rasterio.errors.WindowError:
-                            print(f"[INFO] Admin piece {piece_cea} does not intersect population raster → skipping piece")
-                            continue
-                        except ValueError as e:
-                            # Catch NaN window / invalid bounds
-                            print(f"[INFO] Admin piece {piece_cea} failed to load population ({e}) → skipping piece")
-                            continue
-
-                        pop_arr = pop_piece_masked._ndarray.astype(np.float32, copy=False)
-
-                        exposure_resampled = (
-                            admin_exposure
-                            .resample_to(pop_piece_masked, resampling="nearest")
-                            .mask(piece_cea, all_touched=True)
-                        )
-                        exposure_arr = exposure_resampled._ndarray.astype(np.float32, copy=False)
-
-                        # ----------------------------
-                        # Valid cells
-                        # ----------------------------
-                        pop_mask = (pop_arr > 0) & np.isfinite(pop_arr)
-                        exposure_mask = (exposure_arr > 0) & np.isfinite(exposure_arr)
-                        valid_mask = pop_mask & exposure_mask
+                    except rasterio.errors.WindowError:
+                        # No overlap with raster → skip this piece
+                        continue
+                    
+                    # take the intersection of piece_wgs84 with the raster bounds
+                    minx, maxx, miny, maxy = admin_exposure.bounds
+                    buffer = 0.2
+                    minx -= buffer
+                    maxx += buffer
+                    miny -= buffer
+                    maxy += buffer
+                    raster_bounds = box(minx, miny, maxx, maxy)
 
 
-                        if valid_mask.any():
-                            person_storm_hours_total += (
-                                pop_arr[valid_mask] * exposure_arr[valid_mask]
-                            ).sum()
+                    # Intersect and clip
+                    intersection = piece_wgs84.intersection(raster_bounds)
+                    intersection_gdf = gpd.GeoDataFrame(geometry=[intersection], crs="EPSG:4326")
+                    intersection_cea = intersection_gdf.to_crs("ESRI:54034").iloc[0].geometry
+                    intersection_cea_bounds = intersection_cea.bounds
+                    
 
-                            population_exposed_total += pop_arr[valid_mask].sum()
-                            # print(f"Pop exposed: {population_exposed_total}")
-                        # skip if valid mask is empty → no exposed population in this piece
-                        else:
-                            print("[INFO] No valid population-exposure cells in piece → skipping piece")
-                            del pop_piece, pop_piece_masked, exposure_resampled
-                            del pop_arr, exposure_arr
-                            del pop_mask, exposure_mask, valid_mask
-                            gc.collect()
-                            continue
-                            
-                        # cleanup piece memory
+                    # ----------------------------
+                    # Load population
+                    # ----------------------------
+                    try:
+                        pop_piece = load_in_gridded_population(year, 100, bounds=intersection_cea_bounds)
+                        pop_piece_masked = pop_piece.mask(piece_cea, all_touched=True)
+                    except rasterio.errors.WindowError:
+                        print(f"[INFO] Admin piece {piece_cea} does not intersect population raster → skipping piece")
+                        continue
+                    except ValueError as e:
+                        # Catch NaN window / invalid bounds
+                        print(f"[INFO] Admin piece {piece_cea} failed to load population ({e}) → skipping piece")
+                        continue
+                    
+                    # --- use masked population as the reference grid ---
+                    pop_arr = pop_piece_masked._ndarray.astype(np.float32, copy=False)
+
+                    # --- resample exposure to masked population grid ---
+                    exposure_resampled = admin_exposure.resample_to(pop_piece_masked, resampling="nearest")
+
+                    # optional but safer: enforce identical mask explicitly
+                    exposure_resampled = exposure_resampled.mask(piece_cea, all_touched=True)
+
+                    exposure_arr = exposure_resampled._ndarray.astype(np.float32, copy=False)
+
+
+                    # ----------------------------
+                    # Valid cells
+                    # ----------------------------
+                    pop_mask = (pop_arr > 0) & np.isfinite(pop_arr)
+                    exposure_mask = (exposure_arr > 0) & np.isfinite(exposure_arr)
+                    valid_mask = pop_mask & exposure_mask
+
+                    if valid_mask.any():
+                        person_storm_hours_total += (
+                            pop_arr[valid_mask] * exposure_arr[valid_mask]
+                        ).sum()
+
+                        population_exposed_total += pop_arr[valid_mask].sum()
+                        # print(f"Pop exposed: {population_exposed_total}")
+                    # skip if valid mask is empty → no exposed population in this piece
+                    else:
+                        print("[INFO] No valid population-exposure cells in piece → skipping piece")
                         del pop_piece, pop_piece_masked, exposure_resampled
                         del pop_arr, exposure_arr
                         del pop_mask, exposure_mask, valid_mask
                         gc.collect()
+                        continue
+                        
+                    # cleanup piece memory
+                    del pop_piece, pop_piece_masked, exposure_resampled
+                    del pop_arr, exposure_arr
+                    del pop_mask, exposure_mask, valid_mask
+                    gc.collect()
 
-                # -----------------------------------------
-                # Final write (per admin)
-                # -----------------------------------------
-                if person_storm_hours_total == 0:
-                    continue
-
+                
                 storm_records.append(
                     {
                         "draw": draw,
@@ -1432,6 +1400,7 @@ def process_single_draw(args):
                         "special_region_flag": special_region_flag,
                     }
                 )
+
 
             # save storm-level exposure immediately
             if storm_records:
@@ -1482,7 +1451,6 @@ def process_single_draw(args):
     )
 
     return 
-
 
 
 

@@ -45,17 +45,24 @@ num_cores = args.num_cores
 
 
 # Constants
-PAF_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2/")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3/")
+PAF_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2/")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2/")
 # SAVE_ROOT = Path("/mnt/share/scratch/users/mfiking/outputs/stage3") # TEST
 
 GDF_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84_admin0.parquet")
 POP_TOTALS_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/fhs_population_2021_all_years.parquet")
 ANTIMERIDIAN = LineString([(180, -90), (180, 90)])
+SHP_ROOT_NORMALIZED = Path('/snfs1/WORK/11_geospatial/admin_shapefiles/2024_07_29')
 
 ##############################
 #     Helper Functions       #
 ##############################
+def normalize_geom_to_0_360(geom):
+    """Shift WGS84 geometry from -180–180 to 0–360 for clipping against 0–360 raster."""
+    def shift_x(x, y, z=None):
+        return x + 360 if x < 0 else x, y
+    return shapely.ops.transform(shift_x, geom)
+
 def normalize_longitudes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Shift geometries with x > 180 to x - 360 to avoid wraparound issues."""
     def shift_geom(geom):
@@ -69,13 +76,21 @@ def normalize_longitudes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf["geometry"] = gdf["geometry"].apply(shift_geom)
     return gdf
 
+def normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
+    ds = ds.assign_coords(
+        lon=(((ds.lon + 180) % 360) - 180)
+    ).sortby("lon")
+
+    return ds
+
 def subset_affected_area(
     rr_raster: rt.RasterArray,
     threshold: float = 0.0,
 ) -> rt.RasterArray:
     """
-    Subset a RasterArray to the minimal bounding box
-    where RR > threshold, using rasterra.clip().
+    Subset a RasterArray to the minimal bounding box where RR > threshold.
+
+    If no pixels exceed the threshold, the original raster is returned.
 
     Parameters
     ----------
@@ -87,13 +102,15 @@ def subset_affected_area(
     Returns
     -------
     RasterArray
-        Subset raster clipped to affected area.
+        Subset raster clipped to affected area, or original raster if none affected.
     """
     data = np.asarray(rr_raster.data)
 
     mask = np.isfinite(data) & (data > threshold)
     if not np.any(mask):
-        raise ValueError("No affected pixels found (RR > threshold).")
+        # No affected pixels → return original raster
+        print("[INFO] subset_affected_area: no pixels above threshold, returning original raster")
+        return rr_raster
 
     rows, cols = np.where(mask)
 
@@ -110,8 +127,7 @@ def subset_affected_area(
     geom = box(xmin, ymin, xmax, ymax)
     gdf = gpd.GeoDataFrame(geometry=[geom], crs=rr_raster.crs)
 
-
-    # Native rasterra clip
+    # Clip raster to affected area
     return rr_raster.clip(gdf)
 
 def reproject_raster_to_equal_area(raw_paf_raster):
@@ -121,20 +137,42 @@ def reproject_raster_to_equal_area(raw_paf_raster):
     return raw_paf_raster
 
 def reproject_shapefile_to_equal_area(raw_paf_raster, intersected_shapes, basin):
+    # --- Normalize longitudes if crossing antimeridian ---
     maxx = intersected_shapes.geometry.bounds.maxx.max()
     if maxx > 180:
-        # geometry crosses the antimeridian
         intersected_shapes = normalize_longitudes(intersected_shapes)
 
-    intersected_shapes = intersected_shapes.to_crs(raw_paf_raster.crs)
-    xmin, xmax, ymin, ymax = raw_paf_raster.bounds
-    raster_bbox = box(xmin, ymin, xmax, ymax)
-    bbox_gdf = gpd.GeoDataFrame(geometry=[raster_bbox], crs=raw_paf_raster.crs)
-    intersected_shapes = intersected_shapes.clip(bbox_gdf)
-    intersected_shapes["geometry"] = intersected_shapes.geometry.apply(_polygonize)
-    
-    return intersected_shapes
+    # --- Attempt to reproject raster first ---
+    raster_reprojected = False
+    try:
+        raw_paf_raster_cea = reproject_raster_to_equal_area(raw_paf_raster)
+        raster_reprojected = True
+    except Exception as e:
+        print(f"[WARNING] Raster reprojection failed ({e}) → will skip raster-based clipping")
 
+    # --- Reproject shapes to raster CRS or ESRI:54034 if raster failed ---
+    if raster_reprojected:
+        intersected_shapes = intersected_shapes.to_crs(raw_paf_raster_cea.crs)
+
+        # --- Safe clipping & polygonizing using raster bounds ---
+        try:
+            xmin, xmax, ymin, ymax = raw_paf_raster_cea.bounds
+            raster_bbox = box(xmin, ymin, xmax, ymax)
+            bbox_gdf = gpd.GeoDataFrame(geometry=[raster_bbox], crs=raw_paf_raster_cea.crs)
+            clipped = intersected_shapes.clip(bbox_gdf)
+            if clipped.empty:
+                print("[INFO] Clipping would empty intersected_shapes → skipping clip")
+            else:
+                intersected_shapes = clipped
+                intersected_shapes["geometry"] = intersected_shapes.geometry.apply(_polygonize)
+        except Exception as e:
+            print(f"[WARNING] Clipping failed ({e}) → skipping clip")
+    else:
+        # Raster failed, just reproject shapes directly to equal area CRS
+        intersected_shapes = intersected_shapes.to_crs("ESRI:54034")
+        intersected_shapes["geometry"] = intersected_shapes.geometry.apply(_polygonize)
+
+    return intersected_shapes
 ##############################
 #     Load Raw PAF Raster    #
 ##############################
@@ -196,6 +234,20 @@ def load_shapefiles():
 
     return shapefile
 
+def load_shapefiles_normalized(
+    shapefile_root: Path = SHP_ROOT_NORMALIZED,
+) -> gpd.GeoDataFrame:
+    """
+    Load land polygons intersecting storm bounding box (-180 to 180 longitude space).
+    """
+    admin_level = 0
+    simplified_suffix = ''
+
+    # --- Load shapefile ---
+    shp_path = shapefile_root / f"lbd_standard_admin_{admin_level}{simplified_suffix}.shp"
+    gdf = gpd.read_file(shp_path)
+
+    return gdf
 ##########################################
 #           Load Population              #
 ##########################################
@@ -472,15 +524,14 @@ def check_if_year_complete(
 #       Antemeridian Function            #
 ##########################################
 def split_antimeridian_geom(geom_cea):
-
     gdf = gpd.GeoSeries([geom_cea], crs="ESRI:54034")
     geom_ll = gdf.to_crs("EPSG:4326").iloc[0]
 
     minx, _, maxx, _ = geom_ll.bounds
 
     # no crossing
-    if maxx - minx <= 180:
-        return [geom_cea]
+    if not (maxx > 180 or minx < -180 or (maxx - minx > 180)):
+        return [geom_cea], [geom_ll]  # <--- return both CEA and WGS84
 
     result = split(geom_ll, ANTIMERIDIAN)
 
@@ -506,7 +557,10 @@ def split_antimeridian_geom(geom_cea):
         .tolist()
     )
 
-    return out_cea
+    # WGS84 output
+    out_wgs84 = out_ll
+
+    return out_cea, out_wgs84
 
 ##########################################
 #            MAIN FUNCTION               #
@@ -541,7 +595,10 @@ def process_single_year(args):
         return
 
     # load shapefile and population once per year
-    shapefile = load_shapefiles()
+    if basin == "NA":
+        shapefile = load_shapefiles_normalized()
+    else:
+        shapefile = load_shapefiles()
     pop_df = load_population_dataframe()
     paf_records = []
 
@@ -560,6 +617,7 @@ def process_single_year(args):
         )
     )
 
+
     intersected_shapes = intersect_shapefile_with_raster(
         shapefile,
         raw_paf_raster,
@@ -573,7 +631,6 @@ def process_single_year(args):
         return
 
     # Reproject once
-    raw_paf_raster = reproject_raster_to_equal_area(raw_paf_raster)
     intersected_shapes = reproject_shapefile_to_equal_area(raw_paf_raster, intersected_shapes, basin)
 
     print(f"Processing year {year} with {len(intersected_shapes)} intersected shapes")
@@ -584,29 +641,63 @@ def process_single_year(args):
         admin_id = admin_shape["loc_id"]
 
         # split if crossing antimeridian
-        geom_pieces = split_antimeridian_geom(admin_geom)
-        if not geom_pieces:
-            geom_pieces = [admin_geom]
+        geom_pieces_cea, geom_pieces_wgs84 = split_antimeridian_geom(admin_geom)
+        if not geom_pieces_cea:
+            geom_pieces_cea = [admin_geom]
+            geom_pieces_wgs84 = [gpd.GeoSeries([admin_geom], crs="ESRI:54034").to_crs("EPSG:4326").iloc[0]]
+
+        print(f"Split into {len(geom_pieces_cea)} pieces after antimeridian check")
 
         numerator_total = 0.0
         population_exposed_total = 0.0
 
-        for piece_geom in geom_pieces:
+        for piece_cea, piece_wgs84 in zip(geom_pieces_cea, geom_pieces_wgs84):
+            # use precomputed WGS84 piece
+            if basin != "NA":                 
+                piece_wgs84 = normalize_geom_to_0_360(piece_wgs84)
 
-            # ----------------------------
-            # Clip PAF raster to piece
-            # ----------------------------
-            paf_piece = raw_paf_raster.clip(piece_geom).mask(piece_geom, all_touched=True)
+            paf_piece = raw_paf_raster.clip(piece_wgs84).mask(piece_wgs84, all_touched=True)
+            paf_piece = subset_affected_area(paf_piece)
 
+            # take the intersection of piece_wgs84 with the raster bounds
+            minx, maxx, miny, maxy = paf_piece.bounds
+            buffer = 0.2
+            minx -= buffer
+            maxx += buffer
+            miny -= buffer
+            maxy += buffer
+            raster_bounds = box(minx, miny, maxx, maxy)
+
+
+            # Intersect and clip
+            intersection = piece_wgs84.intersection(raster_bounds)
+            intersection_gdf = gpd.GeoDataFrame(geometry=[intersection], crs="EPSG:4326")
+            intersection_cea = intersection_gdf.to_crs("ESRI:54034").iloc[0].geometry
+            intersection_cea_bounds = intersection_cea.bounds
+            
             # ----------------------------
             # Load population (bounded)
             # ----------------------------
-            pop_piece = load_in_gridded_population(year, 100, bounds=piece_geom.bounds)
-            pop_piece = pop_piece.mask(piece_geom, all_touched=True)
+            pop_piece = load_in_gridded_population(year, 100, bounds=intersection_cea_bounds)
 
-            pop_arr = pop_piece._ndarray.astype(np.float32, copy=False)
-            paf_arr = paf_piece.resample_to(pop_piece)._ndarray.astype(np.float32, copy=False)
-            del paf_piece, pop_piece
+            try:
+                pop_piece_masked = pop_piece.mask(piece_cea, all_touched=True)
+                del pop_piece
+            except rasterio.errors.WindowError:
+                print("[INFO] Admin piece does not intersect raster → skipping piece")
+                continue
+
+            # Extract arrays
+            pop_arr = pop_piece_masked._ndarray.astype(np.float32, copy=False)
+
+            # --- resample PAF to masked grid ---
+            paf_arr = (
+                paf_piece
+                .resample_to(pop_piece_masked, resampling="nearest")
+                ._ndarray.astype(np.float32, copy=False)
+            )
+
+            del paf_piece, pop_piece_masked
             gc.collect()
 
             # ----------------------------
@@ -650,7 +741,7 @@ def process_single_year(args):
         })
 
         # explicitly clean per admin
-        del numerator_total, population_exposed_total, geom_pieces, admin_geom
+        del numerator_total, population_exposed_total, geom_pieces_cea, geom_pieces_wgs84, admin_geom
         gc.collect()
 
     # ----------------------------

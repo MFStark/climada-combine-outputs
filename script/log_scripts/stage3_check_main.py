@@ -43,9 +43,9 @@ sample_name = args.sample_name
 
 
 # Constants
-PAF_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2/")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3/")
-LOG_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_log/")
+PAF_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2/")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2/")
+LOG_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2_log/")
 
 def classify_error(e: Exception) -> str:
     msg = str(e).lower()

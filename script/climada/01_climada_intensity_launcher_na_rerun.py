@@ -135,6 +135,7 @@ meta_df = meta_df.drop(columns=["task_id", "draw"]).drop_duplicates()
 
 # replace nan basin with "NA"
 meta_df["basin"] = meta_df["basin"].fillna("NA")
+meta_df = meta_df[meta_df["basin"] == "NA"]
 
 # Normalize column names
 meta_df = meta_df.rename(columns={
@@ -158,204 +159,8 @@ full_tasks_df = (
     .drop(columns=["key"])
 )
 
-#####################
-workflow_id1 = 554734
-workflow_id2 = 554955
-workflow_id3 = 555162
-workflow_id4 = 555247 
-workflow_id5 = 555408
-workflow_id6 = 555532 
-workflow_id7 = 555619 
-workflow_id8 = 555733
-workflow_id9 = 556078 
-
-workflow_ids = [workflow_id1, workflow_id2, workflow_id3, workflow_id4, workflow_id5, workflow_id6, workflow_id7, workflow_id8, workflow_id9]
-
-total_df_list = []
-
-for workflow_id in workflow_ids:
-    df = workflow_tasks(
-        workflow_id=workflow_id,
-        limit=-1   # return all tasks
-    )
-    completed_df = df[df["STATUS"] == "D"]
-    total_df_list.append(completed_df)
-
-
-total_df = pd.concat(total_df_list, ignore_index=True)
-
-# Create completed parameters df
-parts = total_df["TASK_NAME"].str.split("_", expand=True)
-
-
-complete_parameters = pd.DataFrame({
-    "source_id": parts[2],
-    "variant_label": parts[3],
-    "experiment_id": parts[4],
-    "batch_year": parts[5],
-    "basin": parts[6],
-    "draw_batch": parts[7].str.removeprefix("d"),
-})
-
-
-complete_parameters = complete_parameters.merge(full_tasks_df, on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="inner")
-
-
-# drop complete parameters from full tasks to get remaining tasks
-
-remaining_meta = full_tasks_df.merge(complete_parameters[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]], on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="left", indicator=True)
-remaining_meta = remaining_meta[remaining_meta["_merge"] == "left_only"].drop(columns=["_merge"])
-
-####################################################################3
-# ordering
-storm_draw_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/storm_draw_table.csv")
-storm_draw_df = storm_draw_df[["storm_draw", "source_id", "variant_label"]]
-
-combo_cols = ["source_id", "variant_label"]
-storm_draw_df["draw_rank_within_model"] = (
-    storm_draw_df
-    .sort_values("storm_draw")
-    .groupby(combo_cols)["storm_draw"]
-    .rank(method="dense")
-    .astype(int)
-)
-storm_draw_df = storm_draw_df.sort_values(
-    [
-        "draw_rank_within_model",  # round-robin across models
-        "source_id",
-        "variant_label",
-        "storm_draw",
-    ]
-).reset_index(drop=True)
-storm_draw_df = storm_draw_df[:8]
-new_meta = remaining_meta.merge(
-    storm_draw_df,
-    on=["source_id", "variant_label"],
-    how="left"
-)
-new_meta = new_meta.sort_values(
-    [
-        "draw_rank_within_model",  # round-robin across models
-        "source_id",
-        "variant_label",
-        "storm_draw",
-        "experiment_id",
-        "batch_year",
-        "basin",
-        "draw_batch",
-        "memory_req",
-        "max_run_time",
-    ]
-).reset_index(drop=True)
-
-
-new_meta = new_meta.sort_values(
-    [
-        "storm_draw",
-        "source_id",
-        "variant_label",
-        "experiment_id",
-        "batch_year",
-        "basin",
-        "draw_batch",
-        "memory_req",
-        "max_run_time",
-    ]
-).reset_index(drop=True)
-
-
-
-#####################################################
-# round robin by strom draw and batch draws
-
-# combo_cols = ["source_id", "variant_label"]
-
-# combo_order = (
-#     new_meta[combo_cols]
-#     .drop_duplicates()
-#     .sort_values(combo_cols)
-#     .reset_index(drop=True)
-# )
-
-# combo_order["combo_rank"] = combo_order.index
-
-# new_meta = new_meta.merge(combo_order, on=combo_cols, how="left")
-
-# priority_batches = set(range(5))
-
-# new_meta["batch_priority"] = (
-#     ~new_meta["draw_batch"].isin(priority_batches)
-# ).astype(int)
-
-# new_meta = new_meta.sort_values(
-#     [
-#         "combo_rank",        # finish one combo before moving to next
-#         "batch_priority",    # draw_batch 0–5 first
-#         "draw_batch",        # ordered within priority
-#         "experiment_id",
-#         "batch_year",
-#         "basin",
-#         "draw_rank_within_model",  # stable ordering within combo
-#         "storm_draw",
-#         "memory_req",
-#         "max_run_time",
-#     ]
-# ).reset_index(drop=True)
-
-##########################################################
-# new_meta = new_meta[new_meta["draw_batch"].isin(["0-4"])]
-
-
-# # replace draw_batch 0-4 with "0-0" for simplicity in tracking
-# new_meta["draw_batch"] = "0-0"
-
-# # drop duplicate rows
-# new_meta = new_meta.drop_duplicates(subset=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]).copy()
-
-# # replace num cores to 1 because we will run sequentially for testing
-# new_meta["num_cores"] = 1
-
-# # replace memory requirement to 10G for testing
-# new_meta["memory_req"] = "30G"
-
-
-# workflow_id_new = 555679
-
-# df_new = workflow_tasks(
-#     workflow_id=workflow_id_new,
-#     limit=-1   # return all tasks
-# )
-
-# completed_df_new = df_new[df_new["STATUS"].isin(["D", "Done", "DONE"])]
-
-# parts_new = completed_df_new["TASK_NAME"].str.split("_", expand=True)
-# completed_parameters_new = pd.DataFrame({
-#     "source_id": parts_new[2],
-#     "variant_label": parts_new[3],
-#     "experiment_id": parts_new[4],
-#     "batch_year": parts_new[5],
-#     "basin": parts_new[6],
-#     "draw_batch": parts_new[7].str.removeprefix("d"),
-# })
-
-# completed_parameters_new = completed_parameters_new.merge(
-#     completed_parameters_new,
-#     on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"],
-#     how="inner"
-# )
-
-# remaining_meta_new = new_meta.merge(
-#     completed_parameters_new[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]],
-#     on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"],
-#     how="left",
-#     indicator=True
-# )
-
-# remaining_meta_new = remaining_meta_new[remaining_meta_new["_merge"] == "left_only"].drop(columns=["_merge"])
-
-# new_meta = remaining_meta_new.copy()
-
-#############################################################
+# sort by source_id, variant_label, experiment_id, batch_year, basin, draw_batch
+full_tasks_df = full_tasks_df.sort_values(["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]).reset_index(drop=True)
 
 user = getpass.getuser()
 
@@ -391,7 +196,7 @@ workflow.set_default_compute_resources_from_dict(
 )
 
 # Get unique combinations of runtime, cores, and memory
-unique_configs = new_meta[['max_run_time', 'num_cores', 'memory_req']].drop_duplicates()
+unique_configs = full_tasks_df[['max_run_time', 'num_cores', 'memory_req']].drop_duplicates()
 
 # Create task templates for each unique configuration
 task_templates = {}
@@ -409,7 +214,7 @@ for _, config in unique_configs.iterrows():
             "project": project,
         },
         command_template=(
-            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/01_climada_intensity_main.py "
+            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/01_climada_intensity_main_na_rerun.py "
             "--source_id {source_id} "
             "--variant_label {variant_label} "
             "--experiment_id {experiment_id} "
@@ -425,7 +230,7 @@ for _, config in unique_configs.iterrows():
 
 # Create tasks using the appropriate template
 tasks = []
-for row in new_meta.itertuples():
+for row in full_tasks_df[1:].itertuples():
     config_key = f"rt{row.max_run_time}_c{row.num_cores}_m{row.memory_req}"
     template = task_templates[config_key]
     

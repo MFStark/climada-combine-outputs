@@ -46,14 +46,93 @@ sample_name = args.sample_name
 num_cores = args.num_cores
 
 # Constants
-ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2")
+ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2")
+ERROR_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2_storm_errors")
 
 class StormMeta(NamedTuple):  # type: ignore
     storm_path: Path
     start_year: int
     end_year: int
     storm_id: str
+
+def iter_storms_metadata_debug(draw_store: Path, error_dir: Path = ERROR_DIR) -> list[StormMeta]:
+    """
+    Return a list of StormMeta for each storm in the draw, without loading full data.
+    Logs all storms with errors to a single CSV file and raises an error if any are found.
+    """
+    if not draw_store.exists():
+        raise FileNotFoundError(f"Draw store not found: {draw_store}")
+
+    storm_paths = sorted(
+        p for p in draw_store.iterdir() if p.is_dir() and p.name.startswith("storm_")
+    )
+
+    storms_meta = []
+    error_list = []
+
+    for storm_path in storm_paths:
+        try:
+            ds = xr.open_zarr(storm_path, consolidated=False, chunks={})  # lazy read, no load
+            start_year = pd.to_datetime(ds.attrs["start_date"]).year
+            end_year = pd.to_datetime(ds.attrs["end_date"]).year
+            storm_id = ds.attrs.get("storm_id", storm_path.name)
+            storms_meta.append(StormMeta(storm_path, start_year, end_year, storm_id))
+        except Exception as e:
+            storm_id = storm_path.name
+            error_list.append({"draw_store": str(draw_store), "storm_id": storm_id, "error": str(e)})
+        finally:
+            try:
+                ds.close()
+            except Exception:
+                pass
+
+    # If there were any errors, save them
+    if error_list:
+        error_dir.mkdir(parents=True, exist_ok=True)
+
+        # Extract metadata from path
+        parts = draw_store.parts
+        source_id = parts[-7]
+        variant_label = parts[-6]
+        experiment_id = parts[-5]
+        batch_year = parts[-4]
+        basin = parts[-3]
+
+        # Extract draw from filename
+        name = draw_store.name
+        if "_e" in name:
+            draw = int(name.split("_e")[-1].replace(".zarr", "")) + 1
+        else:
+            draw = 0
+
+        # Build dataframe
+        df = pd.DataFrame(error_list)
+        df["source_id"] = source_id
+        df["variant_label"] = variant_label
+        df["experiment_id"] = experiment_id
+        df["batch_year"] = batch_year
+        df["basin"] = basin
+        df["draw"] = draw
+
+        df = df[
+            [
+                "source_id",
+                "variant_label",
+                "experiment_id",
+                "batch_year",
+                "basin",
+                "draw",
+                "storm_id",
+                "error",
+            ]
+        ]
+
+        error_file = error_dir / f"{draw_store.name}_storm_errors.parquet"
+        df.to_parquet(error_file, index=False)
+
+    return storms_meta
+
 
 
 def iter_storms_metadata(draw_store: Path) -> list[StormMeta]:
@@ -87,6 +166,26 @@ def map_storms_to_years(storms_meta: list[StormMeta], years: list[int]):
 ##########################################
 #          Helper Functions              #
 ##########################################
+
+def normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
+    ds = ds.assign_coords(
+        lon=(((ds.lon + 180) % 360) - 180)
+    ).sortby("lon")
+
+    return ds
+
+
+def ensure_min_grid(da: xr.DataArray, buffer_deg: float = 0.1) -> xr.DataArray:
+    if da.lat.size == 1:
+        c = float(da.lat.values[0])
+        da = da.reindex(lat=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
+
+    if da.lon.size == 1:
+        c = float(da.lon.values[0])
+        da = da.reindex(lon=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
+
+    return da
+
 
 def chmod_recursive(path: Path, mode: int = 0o775):
     for root, dirs, files in os.walk(path):
@@ -299,6 +398,16 @@ def generate_basin_template_raster(basin, res=0.1, buffer_deg=5.0):
     lat_min -= buffer_deg
     lat_max += buffer_deg
 
+    # --- Normalize NA basin to -180 → 180 ---
+    if basin == "NA":
+        lon_min = ((lon_min + 180) % 360) - 180
+        lon_max = ((lon_max + 180) % 360) - 180
+
+        # ensure monotonic bounds
+        if lon_max <= lon_min:
+            lon_max += 360
+
+
     # Number of rows/cols
     n_cols = int(np.ceil((lon_max - lon_min) / res))
     n_rows = int(np.ceil((lat_max - lat_min) / res))
@@ -312,13 +421,13 @@ def generate_basin_template_raster(basin, res=0.1, buffer_deg=5.0):
     transform = Affine(res, 0, lon_min, 0, -res, lat_max)
 
     # Wrap as RasterArray
-    # Wrap as RasterArray
     raster = RasterArray(data=data,
                          transform=transform,
                          crs="EPSG:4326",
                          no_data_value=np.nan
                          )
     return raster
+
 
 ##########################################
 #             Read in Data               #
@@ -435,14 +544,24 @@ def generate_days_impact_from_intensity(
 def subset_affected_area(
     rr_raster: rt.RasterArray,
     threshold: float = 0.0,
-    buffer_pixels: int = 1,  # buffer by N raster cells
 ) -> rt.RasterArray:
     """
     Subset a RasterArray to the minimal bounding box
     where RR > threshold, using rasterra.clip().
-    Buffers by N pixels in the raster's CRS (EPSG:4326 if geographic).
+
+    Parameters
+    ----------
+    rr_raster : RasterArray
+        Storm relative risk raster.
+    threshold : float
+        Threshold defining affected pixels.
+
+    Returns
+    -------
+    RasterArray
+        Subset raster clipped to affected area.
     """
-    data = np.asarray(rr_raster._ndarray)
+    data = np.asarray(rr_raster.data)
 
     mask = np.isfinite(data) & (data > threshold)
     if not np.any(mask):
@@ -463,14 +582,8 @@ def subset_affected_area(
     geom = box(xmin, ymin, xmax, ymax)
     gdf = gpd.GeoDataFrame(geometry=[geom], crs=rr_raster.crs)
 
-    # Buffer by 1 pixel in degrees
-    pixel_width = abs(a)
-    pixel_height = abs(e)
-    pixel_buffer = max(pixel_width, pixel_height) * buffer_pixels
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        gdf["geometry"] = gdf.geometry.buffer(pixel_buffer)
-        
+
+    # Native rasterra clip
     return rr_raster.clip(gdf)
 
 ##########################################
@@ -505,7 +618,10 @@ def generate_relative_risk(
         One DataArray per storm with dims ('lat', 'lon').
     """
 
-    storm_name = da_intensity.attrs["storm_name"]
+    try:
+        storm_name = da_intensity.attrs["storm_name"]
+    except KeyError:
+        storm_name = "none"
     
     # Interpolate RR from windspeed (Katrina logic)
     da_rr = interpolate_rr_from_windspeed(
@@ -608,7 +724,97 @@ def save_raster(
                 time.sleep(retry_delay)
             else:
                 raise RuntimeError(f"Failed to save {save_path} after {max_retries} attempts") from e
-            
+
+def _is_valid_raster(path: Path) -> bool:
+    try:
+        _ = rt.load_raster(path)
+        return True
+    except Exception:
+        return False   
+
+
+def check_if_draw_complete(
+    storm_draw: str,
+    source_id: str,
+    variant_label: str,
+    experiment_id: str,
+    batch_year: str,
+    basin: str,
+    relative_risk: str,
+    sample_name: str,
+    save_root: Path = SAVE_ROOT,
+):
+    """
+    Check if the expected output rasters for a draw already exist.
+
+    Returns True if all expected rasters are present, False otherwise.
+    """
+    start_year, end_year = batch_year.split("-")
+    years = range(int(start_year), int(end_year) + 1)
+
+    for year in years:
+        save_dir = save_root / storm_draw / source_id / variant_label / experiment_id / batch_year / str(year) / basin / "raw_paf"
+        filename = (
+            f"draw_mean_raw_paf_{storm_draw}_{relative_risk}_{sample_name}_{basin}_{source_id}_"
+            f"{experiment_id}_{variant_label}_{start_year}01_{end_year}12_{year}.tif"
+        )
+        save_path = save_dir / filename
+        if not save_path.exists():
+            return False
+
+        if save_path.stat().st_size < 1024:
+            save_path.unlink(missing_ok=True)
+            print(f"⚠️ Found invalid raster (size < 1KB): {save_path}. Deleting and marking draw as incomplete.")
+            return False
+
+        if not _is_valid_raster(save_path):
+            save_path.unlink(missing_ok=True)
+            print(f"⚠️ Found invalid raster (failed to load): {save_path}. Deleting and marking draw as incomplete.")
+            return False
+
+    return True
+
+def get_year_status(
+    storm_draw: str,
+    source_id: str,
+    variant_label: str,
+    experiment_id: str,
+    batch_year: str,
+    basin: str,
+    relative_risk: str,
+    sample_name: str,
+    save_root: Path = SAVE_ROOT,
+):
+    start_year, end_year = batch_year.split("-")
+    years = range(int(start_year), int(end_year) + 1)
+
+    valid_years = []
+    invalid_years = []
+
+    for year in years:
+        save_dir = (
+            save_root / storm_draw / source_id / variant_label /
+            experiment_id / batch_year / str(year) / basin / "raw_paf"
+        )
+
+        filename = (
+            f"draw_mean_raw_paf_{storm_draw}_{relative_risk}_{sample_name}_{basin}_{source_id}_"
+            f"{experiment_id}_{variant_label}_{start_year}01_{end_year}12_{year}.tif"
+        )
+
+        path = save_dir / filename
+
+        if not path.exists():
+            invalid_years.append(year)
+            continue
+
+        if path.stat().st_size < 1024 or not _is_valid_raster(path):
+            path.unlink(missing_ok=True)
+            invalid_years.append(year)
+        else:
+            valid_years.append(year)
+
+    return valid_years, invalid_years
 ##########################################
 #          Main Stage 2 Function         #
 ##########################################
@@ -630,8 +836,9 @@ def process_single_draw(draw):
         sample_name,
         template_raster,
         rr_samples_df,
+        invalid_years,
     ) = draw
-
+    
     # Create template raster for this basin
     # template_raster = generate_basin_template_raster(basin, res=0.1)
 
@@ -647,13 +854,9 @@ def process_single_draw(draw):
     )
     # print(f"intensity_draw: {intensity_draw_store}")
 
-    # Year range for the batch
-    start_year, end_year = map(int, batch_year.split("-"))
-    all_years = list(range(start_year, end_year + 1))
-
     # If no intensity data exists, return empty rasters
     if intensity_draw_store is None or not any(intensity_draw_store.iterdir()):
-        yearly_paf = {year: np.zeros_like(template_raster._ndarray, dtype=np.float32) for year in all_years}
+        yearly_paf = {year: np.zeros_like(template_raster._ndarray, dtype=np.float32) for year in invalid_years}
         print(f"⚠️ Draw {draw} has no intensity data. Returning empty rasters for basin {basin}, batch {batch_year}")
         return yearly_paf
 
@@ -664,10 +867,10 @@ def process_single_draw(draw):
 
     # --- STEP 1: Get metadata for all storms in the draw ---
     storms_meta = iter_storms_metadata(intensity_draw_store)  # returns list of StormMeta
-    storms_by_year = map_storms_to_years(storms_meta, all_years)
+    storms_by_year = map_storms_to_years(storms_meta, invalid_years)
 
     # --- STEP 2: Process each year individually ---
-    for year in all_years:
+    for year in invalid_years:
         # print(f"Processing year: {year}")
         storm_paths_in_year = storms_by_year[year]
 
@@ -689,15 +892,22 @@ def process_single_draw(draw):
         for storm_path in storm_paths_in_year:
             # Open storm lazily
             storm_ds = xr.open_zarr(storm_path, consolidated=False, chunks="auto")
+            storm_ds = ensure_min_grid(storm_ds)  # Ensure minimum 3x3 grid for raster operations
             storm_id = storm_ds.attrs.get("storm_id", storm_path.name)
             # print(f"Storm: {storm_id}")
 
+            # normalize dataset if basin = NA and if needed
+            if basin == "NA":
+                storm_ds = normalize_dataset(storm_ds)
+                
             # Compute RR and days impact
             rr_da = generate_relative_risk(
                 da_intensity=storm_ds["intensity"],
                 rr_samples_df=rr_samples_df,
                 sample_name=sample_name,
             )
+            rr_da = rr_da.where(rr_da > 0)
+
             storm_rr = to_raster(
                 ds=rr_da,
                 no_data_value=np.nan,
@@ -754,13 +964,43 @@ def main(
     num_cores: int,
     save_root: Path = SAVE_ROOT,
 ):
+    
+    # check if output already exists for this draw - if so, skip processing
+    if check_if_draw_complete(
+        storm_draw=storm_draw,
+        source_id=source_id,
+        variant_label=variant_label,
+        experiment_id=experiment_id,
+        batch_year=batch_year,
+        basin=basin,
+        relative_risk=relative_risk,
+        sample_name=sample_name,
+        save_root=save_root,
+    ):
+        print(f"✅ Output rasters already exist for draw {storm_draw}. Skipping processing.")
+        return None
+
+    valid_years, invalid_years = get_year_status(
+        storm_draw=storm_draw,
+        source_id=source_id,
+        variant_label=variant_label,
+        experiment_id=experiment_id,
+        batch_year=batch_year,
+        basin=basin,
+        relative_risk=relative_risk,
+        sample_name=sample_name,
+        save_root=save_root,
+    )
+
+    if len(invalid_years) == 0:
+        print(f"✅ All years valid for draw {storm_draw}. Skipping.")
+        return None
+
+    print(f"Recomputing years: {invalid_years}")
     draws = list(range(100))
 
     # Define batch size based on number of cores
     batch_size = num_cores
-
-    start_year, end_year = map(int, batch_year.split("-"))
-    all_years = list(range(start_year, end_year + 1))
 
     # Generate basin-wide template raster once
     template_raster = generate_basin_template_raster(basin, res=0.1)
@@ -768,7 +1008,10 @@ def main(
     rr_samples_df = load_relative_risk_df(relative_risk=relative_risk)
 
     # Initialize cumulative dictionaries to hold sums across draws
-    cumulative_paf = {year: np.zeros_like(template_raster._ndarray, dtype=np.float32) for year in all_years}
+    cumulative_paf = {
+        year: np.zeros_like(template_raster._ndarray, dtype=np.float32)
+        for year in invalid_years
+    }
 
     for batch_start in range(0, len(draws), batch_size):
         batch_draws = draws[batch_start: batch_start + batch_size]
@@ -788,6 +1031,7 @@ def main(
                 sample_name,
                 template_raster,
                 rr_samples_df,
+                invalid_years,
             )
             for draw in batch_draws
         ]
@@ -802,7 +1046,7 @@ def main(
 
         # # batch_results is a list of yearly_paf dictionaries returned from each draw
         for draw_yearly_paf in batch_results:
-            for year in all_years:
+            for year in invalid_years:
                 arr = draw_yearly_paf.get(year)
                 if arr is not None:
                     cumulative_paf[year] += arr
@@ -812,7 +1056,7 @@ def main(
     final_paf = {year: arr / n_draws for year, arr in cumulative_paf.items()}
 
     # Save to disk per year
-    for year in all_years:
+    for year in invalid_years:
         arr = final_paf[year]
 
         save_raster(

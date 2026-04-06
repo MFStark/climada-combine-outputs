@@ -22,6 +22,7 @@ import rasterra as rt  # type: ignore
 from shapely.geometry import Polygon, MultiPolygon
 from affine import Affine  # type: ignore
 from rasterio.errors import WindowError
+import shutil
 
 
 import logging
@@ -57,6 +58,7 @@ LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage
 COUNTRY_LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2_storm_country_log/")
 RESOLUTION = 0.1  # degrees
 GDF_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84.parquet")
+SHP_ROOT_NORMALIZED = Path('/snfs1/WORK/11_geospatial/admin_shapefiles/2024_07_29')
 
 ######################################
 #        Read in Tracks              #
@@ -788,6 +790,35 @@ def load_land_polygons_for_storm(
 
     return gdf_subset
 
+def load_land_polygons_for_storm_normalized(
+    storm_da,
+    shapefile_root: Path,
+    buffer: float = 2.0,
+) -> gpd.GeoDataFrame:
+    """
+    Load land polygons intersecting storm bounding box (-180 to 180 longitude space).
+    """
+    admin_level = 0
+    simplified_suffix = ''
+    # --- Bounding box ---
+    min_lon = float(storm_da["lon"].min()) - buffer
+    max_lon = float(storm_da["lon"].max()) + buffer
+    min_lat = float(storm_da["lat"].min()) - buffer
+    max_lat = float(storm_da["lat"].max()) + buffer
+
+    # --- Load shapefile ---
+    shp_path = shapefile_root / f"lbd_standard_admin_{admin_level}{simplified_suffix}.shp"
+    gdf = gpd.read_file(shp_path)
+
+    # --- Simple bbox (no wraparound needed in -180 to 180) ---
+    bbox_geom = box(min_lon, min_lat, max_lon, max_lat)
+
+    # --- Spatial filter ---
+    gdf_subset = gdf[gdf.intersects(bbox_geom)].copy()
+    gdf_subset["geometry"] = gdf_subset.geometry.intersection(bbox_geom)
+
+    return gdf_subset
+
 def check_storm_landfall(
     storm_da: xr.DataArray,
     land_gdf: "gpd.GeoDataFrame",
@@ -1046,8 +1077,9 @@ def save_single_storm_intensity(
     if draw_store.exists():
         z = zarr.open(draw_store, mode="a")
         if storm_key in z:
-            print(f"⚠️ Storm {storm_index} already exists in {draw_store}, skipping.")
-            return
+            print(f"♻️ Overwriting existing storm {storm_index} in {draw_store}")
+            # delete the existing storm group
+            del z[storm_key]
         
     # Defensive copy & cast
     da = da.copy()
@@ -1134,9 +1166,10 @@ def save_single_storm_exposure(
     if draw_store.exists():
         z = zarr.open(draw_store, mode="a")
         if storm_key in z:
-            print(f"⚠️ Storm {storm_index} already exists in {draw_store}, skipping.")
-            return
-        
+            print(f"♻️ Overwriting existing storm {storm_index} in {draw_store}")
+            # delete the existing storm group
+            del z[storm_key]
+            
     # Defensive copy
     da = da.copy()
     da.name = "exposure_hours"
@@ -1426,18 +1459,18 @@ def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
     """
 
     # Check if storm has already been processed (by checking all three stores)
-    if check_existing_storm_in_zarr(
-        source_id=source_id,
-        variant_label=variant_label,
-        experiment_id=experiment_id,
-        batch_year=batch_year,
-        basin=basin,
-        draw=draw,
-        storm_index=storm_index,
-        save_root=save_root,
-    ):
-        print(f"⚠️ Storm {storm_index} already processed in all metrics, skipping.")
-        return
+    # if check_existing_storm_in_zarr(
+    #     source_id=source_id,
+    #     variant_label=variant_label,
+    #     experiment_id=experiment_id,
+    #     batch_year=batch_year,
+    #     basin=basin,
+    #     draw=draw,
+    #     storm_index=storm_index,
+    #     save_root=save_root,
+    # ):
+    #     print(f"⚠️ Storm {storm_index} already processed in all metrics, skipping.")
+    #     return
     
     # --- Load storm directly from open dataset ---
     ds_track = read_single_storm_from_dataset(ds_all, storm_index)
@@ -1447,8 +1480,22 @@ def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
 
     storm_intensity = generate_intensity_per_storm(haz, centroids, tc_tracks)
 
+    # check if storm has values past 360, if not then skip storm since it was processed correctly in 0-360 space
+    lon_max = float(storm_intensity.lon.max())
+    if lon_max < 359.9:
+        return
+    
+    # normalize storm to -180 to 180
+    storm_intensity = storm_intensity.assign_coords(
+        lon=(((storm_intensity.lon + 180) % 360) - 180)
+    ).sortby("lon")
+
     # check landfall
-    land_gdf = load_land_polygons_for_storm(storm_intensity, GDF_PATH)
+    land_gdf = load_land_polygons_for_storm_normalized(
+        storm_da=storm_intensity,
+        shapefile_root=SHP_ROOT_NORMALIZED,
+        buffer=2.0,
+    )
 
     if land_gdf.empty:
         print(f"⚠️ No land polygons intersect storm {storm_index} bounding box, skipping landfall check and marking as no landfall.")
@@ -1461,47 +1508,47 @@ def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
         print(f"⚠️ Storm {storm_index} does not make landfall, skipping exposure and days impact.")
         return
 
-    # track storm duration for logging
-    track_storm_duration(
-        storm_intensity,
-        source_id=source_id,
-        variant_label=variant_label,
-        experiment_id=experiment_id,
-        batch_year=batch_year,
-        basin=basin,
-        draw=draw,
-    )
+    # # track storm duration for logging
+    # track_storm_duration(
+    #     storm_intensity,
+    #     source_id=source_id,
+    #     variant_label=variant_label,
+    #     experiment_id=experiment_id,
+    #     batch_year=batch_year,
+    #     basin=basin,
+    #     draw=draw,
+    # )
 
     # mask to land
     storm_intensity = clip_raster_to_land(storm_intensity, land_gdf)
 
-    try:
-        loc_ids = get_loc_ids_from_land_da_rra(storm_intensity, land_gdf)
+    # try:
+    #     loc_ids = get_loc_ids_from_land_da_rra(storm_intensity, land_gdf)
 
-        # Only save if something was returned
-        if loc_ids:
-            save_country_storms(
-                loc_ids,
-                source_id=source_id,
-                variant_label=variant_label,
-                experiment_id=experiment_id,
-                batch_year=batch_year,
-                basin=basin,
-                draw=draw,
-                storm_index=storm_index,
-            )
+    #     # Only save if something was returned
+    #     if loc_ids:
+    #         save_country_storms(
+    #             loc_ids,
+    #             source_id=source_id,
+    #             variant_label=variant_label,
+    #             experiment_id=experiment_id,
+    #             batch_year=batch_year,
+    #             basin=basin,
+    #             draw=draw,
+    #             storm_index=storm_index,
+    #         )
 
-    except Exception as e:
-        # lightweight, non-blocking logging
-        print(
-            f"[WARN] loc_id extraction failed | "
-            f"storm_index={storm_index}, basin={basin}, draw={draw} | {e}"
-        )
+    # except Exception as e:
+    #     # lightweight, non-blocking logging
+    #     print(
+    #         f"[WARN] loc_id extraction failed | "
+    #         f"storm_index={storm_index}, basin={basin}, draw={draw} | {e}"
+    #     )
 
-    finally:
-        # ensure cleanup if allocated
-        if "loc_ids" in locals():
-            del loc_ids
+    # finally:
+    #     # ensure cleanup if allocated
+    #     if "loc_ids" in locals():
+    #         del loc_ids
 
     # save storm intensity
     save_single_storm_intensity(
@@ -1522,6 +1569,11 @@ def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
         storm_speed,
         wind_threshold=17.0,
     )
+
+    # normalize storm exposure to -180 to 180
+    storm_exposure = storm_exposure.assign_coords(
+        lon=(((storm_exposure.lon + 180) % 360) - 180)
+    ).sortby("lon")
 
     # mask to land
     storm_exposure = clip_raster_to_land(storm_exposure, land_gdf)
@@ -1558,29 +1610,29 @@ def process_single_draw(draw_info):
 
     print(f"▶ Processing draw {draw} | {source_id} {variant_label} {experiment_id} {batch_year} {basin}")
 
-    # check if draw is already completed
-    if is_draw_completed(
-        log_root=LOG_DIR,
-        source_id=source_id,
-        variant_label=variant_label,
-        experiment_id=experiment_id,
-        batch_year=batch_year,
-        basin=basin,
-        draw=draw,
-    ):
-        print(f"⚠️ Draw {draw} already marked as completed, skipping.")
-        return
+    # # check if draw is already completed
+    # if is_draw_completed(
+    #     log_root=LOG_DIR,
+    #     source_id=source_id,
+    #     variant_label=variant_label,
+    #     experiment_id=experiment_id,
+    #     batch_year=batch_year,
+    #     basin=basin,
+    #     draw=draw,
+    # ):
+    #     print(f"⚠️ Draw {draw} already marked as completed, skipping.")
+    #     return
 
-    # check and cleanup any existing stores with partial files before processing
-    check_and_cleanup_zarr_store(
-        source_id=source_id,
-        variant_label=variant_label,
-        experiment_id=experiment_id,
-        batch_year=batch_year,
-        basin=basin,
-        draw=draw,
-        save_root=save_root,
-    )
+    # # check and cleanup any existing stores with partial files before processing
+    # check_and_cleanup_zarr_store(
+    #     source_id=source_id,
+    #     variant_label=variant_label,
+    #     experiment_id=experiment_id,
+    #     batch_year=batch_year,
+    #     basin=basin,
+    #     draw=draw,
+    #     save_root=save_root,
+    # )
 
     nc_file = read_custom_tracks_nc(
         source_id=source_id,
@@ -1591,10 +1643,45 @@ def process_single_draw(draw_info):
         draw=draw,
     )
 
+    start_year, end_year = batch_year.split("-")
+    draw_text = "" if draw == 0 else f"_e{draw - 1}"
+    # get zarr store paths
+    intensity_store = (
+        save_root
+        / source_id
+        / variant_label
+        / experiment_id
+        / batch_year
+        / basin
+        / "intensity"
+        / f"intensity_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}.zarr"
+    )
+    if not intensity_store.exists():
+        print(f"⚠️ No existing Zarr store found, processing all storms.")
+        return
+
+    # get all storm indices for this draw from the zarr store
+    # completed_storm_indices = set()
+    # for path in intensity_store.glob("storm_*/"):
+    #     if path.is_dir():
+    #         try:
+    #             storm_index = int(path.name.split("_")[1])
+    #             completed_storm_indices.add(storm_index)
+    #         except Exception as e:
+    #             print(f"⚠️ Could not parse storm index from {path}: {e}")
+
+    storm_index_rerun = 89
+    completed_storm_indices = {storm_index_rerun}
+
     # 🔥 Open once for entire draw
     with xr.open_dataset(nc_file) as ds_all:
 
         storm_indices = get_storm_indices(ds_all)
+
+        # subset to only indexes that are in completed_storm_indices to rerun
+        if completed_storm_indices:
+            print(f"⚠️ Found {len(completed_storm_indices)} completed storms in draw {draw}, will only process these storms for rerun.")
+            storm_indices = [i for i in storm_indices if i in completed_storm_indices]
 
         centroids = generate_basin_centroids(basin, res=RESOLUTION)
 

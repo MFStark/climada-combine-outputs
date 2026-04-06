@@ -4,6 +4,8 @@ import pandas as pd # type: ignore
 from jobmon.client.status_commands import workflow_tasks, task_status # type: ignore
 from jobmon.client.tool import Tool # type: ignore
 from pathlib import Path
+
+from zarr import full
 from rra_tools.parallel import run_parallel # type: ignore
 import xarray as xr # type: ignore
 import numpy as np
@@ -12,141 +14,6 @@ import math
 RELATIVE_RISKS = ["indirect_resp_draw", "indirect_cvd_draw"]
 
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
-def parse_task_name(df: pd.DataFrame) -> pd.DataFrame:
-    # Split the task_name into components
-    components = df["task_name"].str.split("_", expand=True)
-    
-    # Assign components to new columns
-    task_df = df.copy()
-    task_df["source_id"] = components[2]
-    task_df["variant_label"] = components[3]
-    task_df["experiment_id"] = components[4]
-    task_df["batch_year"] = components[5]
-    task_df["basin"] = components[6]
-    task_df["draw_batch"] = components[7].str[1:]
-    return task_df[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]]
-
-def read_custom_tracks_nc(
-    source_id: str,
-    variant_label: str,
-    experiment_id: str,
-    batch_year: str,
-    basin: str,
-    draw: int = 0,
-) -> xr.Dataset:
-
-    start_year, end_year = batch_year.split("-")
-    draw_text = "" if draw == 0 else f"_e{draw - 1}"
-
-    nc_file = (
-        ROOT_PATH
-        / source_id
-        / variant_label
-        / experiment_id
-        / batch_year
-        / basin
-        / f"tracks_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}.nc"
-    )
-
-    if not nc_file.exists():
-        raise FileNotFoundError(f"NetCDF file not found: {nc_file}")
-
-    return xr.open_dataset(nc_file)
-
-def count_tracks(ds: xr.Dataset) -> int:
-    return ds.sizes["n_trk"]
-
-def single_storm_count(row: pd.Series) -> int:
-    ds = read_custom_tracks_nc(
-        source_id=row["source_id"],
-        variant_label=row["variant_label"],
-        experiment_id=row["experiment_id"],
-        batch_year=row["batch_year"],
-        basin=row["basin"],
-    )
-    num_tracks = count_tracks(ds)
-    ds.close()
-    return num_tracks
-
-def run_storm_count_parallel(task_df: pd.DataFrame) -> pd.DataFrame:
-    task_df = task_df.copy()
-    task_df = task_df[["source_id", "variant_label", "experiment_id", "batch_year", "basin"]].drop_duplicates().reset_index(drop=True)
-    task_df["num_tracks"] = run_parallel(
-        runner=single_storm_count,
-        arg_list=[row for _, row in task_df.iterrows()],
-        num_cores=10,
-        progress_bar=True,
-    )
-    return task_df
-
-
-
-# def assign_run_time(row: pd.Series, num_cores: int = 20) -> pd.Series:
-#     """
-#     Assign runtime and memory based on number of tracks and cores.
-
-#     - Runtime: minimum 1 minute, scales with number of tracks
-#       * <=100 tracks: 1 min
-#       * 101-150 tracks: 2 min
-#       * >150 tracks: 3 min
-#     - Memory: 2GB at 10 cores, linear scaling with cores, plus 1GB buffer
-#     """
-#     num_tracks = row["num_tracks"]
-
-#     # ---- Runtime scaling ----
-#     if num_tracks <= 100:
-#         runtime_min = 120
-#     else:
-#         runtime_min = 180
-
-#     # ---- Scale for 100 draws and cores ----
-#     if num_cores == 10:
-#         runtime_min = runtime_min * 2
-
-#     row["max_run_time"] = runtime_min
-
-#     # ---- Memory scaling ----
-#     row["num_cores"] = num_cores
-#     memory_gb = math.ceil(0.3 * num_cores + 1)
-#     row["memory_req"] = f"{memory_gb}G"
-
-#     return row
-
-
-
-def assign_run_time(row: pd.Series, num_cores: int = 10) -> pd.Series:
-    """
-    Assign runtime and memory based on number of tracks (10–240) and cores.
-
-    - Runtime scales linearly with num_tracks, inversely with cores.
-    - Memory scales linearly with cores, plus a small buffer.
-    """
-
-    num_tracks = row["num_tracks"]
-
-    # --- Runtime scaling ---
-    # Define min/max runtime per draw at 1 core
-    min_runtime = 10   # minutes for smallest track set (~10 tracks)
-    max_runtime = 300  # minutes for largest track set (~240 tracks)
-
-    # Linear scale runtime based on number of tracks
-    runtime_1core = min_runtime + (max_runtime - min_runtime) * (num_tracks - 10) / (240 - 10)
-
-    # Scale inversely with cores
-    runtime_min = math.ceil(runtime_1core * (10 / num_cores))
-    runtime_min = max(runtime_min, 1)
-
-    # --- Memory scaling ---
-    # Base memory 2GB for 5 cores, add 0.35GB per additional core
-    memory_gb = math.ceil(2 + 0.35 * (num_cores - 5))
-    memory_gb = max(memory_gb, 2)
-
-    # Assign to row
-    row["num_cores"] = num_cores
-    row["max_run_time"] = runtime_min
-    row["memory_req"] = f"{memory_gb}G"
-
-    return row
 
 # Read in paths
 meta_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/level_4_task_assignments.csv")
@@ -164,28 +31,174 @@ meta_df = meta_df.rename(columns={
 
 meta_df = meta_df[meta_df["batch_year"] != "1965-1969"]
 
-
-# get counts of storms per source_id, variant_label, experiment_id, batch_year, basin
-meta_df_storm_counts = run_storm_count_parallel(meta_df)
-
 # read in storm draws
 storm_draw_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/storm_draw_table.csv")
 
-complete_df = meta_df_storm_counts.merge(
-    storm_draw_df,
-    on=["source_id", "variant_label",],
+complete_df = meta_df.merge(
+    storm_draw_df, 
+    on=["source_id", "variant_label"],
     how="inner",
 )
 
 # replace storm_draw as storm_draw_XXXX
 complete_df["storm_draw"] = complete_df["storm_draw"].apply(lambda x: f"storm_draw_{x:04d}")
 
-# Assign run times based on storm counts
-full_tasks_df = complete_df.apply(assign_run_time, axis=1)
+priority = [
+    "storm_draw_0002",
+    "storm_draw_0004",
+    "storm_draw_0005",
+    "storm_draw_0007",
+    "storm_draw_0008",
+    "storm_draw_0003",
+    "storm_draw_0006",
+    "storm_draw_0001",
+]
+
+priority_map = {v: i for i, v in enumerate(priority)}
+
+df = complete_df.copy()
+
+df["draw_order"] = df["storm_draw"].map(priority_map)
+
+# fill non-priority draws with large value → go last
+df["draw_order"] = df["draw_order"].fillna(len(priority))
+
+df = df.sort_values(["draw_order", "storm_draw", "source_id", "variant_label", "experiment_id", "batch_year", "basin"]).drop(columns="draw_order")
+
+# # subset to priority storm draws for testing
+# df = df[df["storm_draw"].isin(priority)]
+
+# subset to not the priority storm draws for complete run
+df = df[~df["storm_draw"].isin(priority)]
+
+#########################################################################################
+# assign runtime
+resource_df = pd.read_parquet("/mnt/share/homes/mfiking/downloads/climada_rs/stage2_resource_usage.parquet")
+resource_df = resource_df.drop(columns=["task_id", "runtime", "memory", "memory_gb", "memory_rounded"])
+resource_df = resource_df.rename(columns={
+    "runtime_rounded": "max_run_time",
+})
+
+# assign 4GB
+resource_df["memory_req"] = "4G"
+# assign 10 cores
+resource_df["num_cores"] = 10
+resource_df = resource_df.drop_duplicates(subset=["source_id", "variant_label", "experiment_id", "batch_year", "basin"])
+
+# merge with main df
+final_df = df.merge(
+    resource_df,
+    on=["source_id", "variant_label", "experiment_id", "batch_year", "basin"],
+    how="left"
+)
+# fill any na maxrun_time with 60 minutes, memory_req with 4G, num_cores with 10
+final_df["max_run_time"] = final_df["max_run_time"].fillna(30)
+final_df["memory_req"] = final_df["memory_req"].fillna("4G")
+final_df["num_cores"] = final_df["num_cores"].fillna(10)
 
 
+# round runtimes to 300, 600, 1200, 1800, 2700, 3600, 5700
+def round_runtime(x):
+    if x <= 300:
+        return 300
+    elif x <= 600:
+        return 600
+    elif x <= 1200:
+        return 1200
+    elif x <= 1800:
+        return 1800
+    elif x <= 2700:
+        return 2700
+    elif x <= 3600:
+        return 3600
+    else:
+        return 5700
+    
+final_df["max_run_time"] = final_df["max_run_time"].apply(round_runtime)
+# divide max runtimes by 60 to convert to minutes and round up
+final_df["max_run_time"] = np.ceil(final_df["max_run_time"] / 60).astype(int)
 
 
+#########################################################################################
+workflow_id1 = 557853
+workflow_id2 = 557918
+workflow_id3 = 558362
+workflow_id4 = 558593
+workflow_id5 = 558645
+
+workflow_ids = [workflow_id1, workflow_id2, workflow_id3, workflow_id4, workflow_id5]
+
+total_df_list = []
+
+for workflow_id in workflow_ids:
+    df = workflow_tasks(
+        workflow_id=workflow_id,
+        limit=-1   # return all tasks
+    )
+    completed_df = df[df["STATUS"].isin(["COMPLETED", "D", "DONE", "Done"])]
+    total_df_list.append(completed_df)
+
+
+total_df = pd.concat(total_df_list, ignore_index=True)
+
+# Create completed parameters df
+parts = total_df["TASK_NAME"].str.split("_", expand=True)
+
+complete_parameters = pd.DataFrame({
+    "storm_draw": "storm_draw_" + parts[4],
+    "source_id": parts[5].str.removeprefix("src"),
+    "variant_label": parts[6].str.removeprefix("var"),
+    "experiment_id": parts[7].str.removeprefix("exp"),
+    "batch_year": parts[8].str.removeprefix("yr"),
+    "basin": parts[9],
+    "relative_risk": parts[10] + "_" + parts[11] + "_" + parts[12],
+    "sample_name": parts[13] + "_" + parts[14],
+})
+
+
+rr_cols = ["indirect_cvd_draw", "indirect_resp_draw"]
+
+final_long = final_df.melt(
+    id_vars=[
+        "source_id",
+        "variant_label",
+        "experiment_id",
+        "batch_year",
+        "basin",
+        "storm_draw",
+        "max_run_time",
+        "runtime_min",
+        "memory_req",
+        "num_cores",
+    ],
+    value_vars=rr_cols,
+    var_name="relative_risk",
+    value_name="sample_name",
+)
+
+remaining_long = final_long.merge(
+    complete_parameters,
+    on=[
+        "source_id",
+        "variant_label",
+        "experiment_id",
+        "batch_year",
+        "basin",
+        "storm_draw",
+        "relative_risk",
+        "sample_name",
+    ],
+    how="left",
+    indicator=True,
+)
+
+remaining_long = remaining_long[remaining_long["_merge"] == "left_only"].copy()
+
+# multiply max_run_time by 3
+remaining_long["max_run_time"] = remaining_long["max_run_time"] * 3
+
+
+############################################################################################
 
 user = getpass.getuser()
 
@@ -222,7 +235,7 @@ workflow.set_default_compute_resources_from_dict(
 
 
 # Get unique combinations of runtime, cores, and memory
-unique_configs = full_tasks_df[['max_run_time', 'num_cores', 'memory_req']].drop_duplicates()
+unique_configs = remaining_long[['max_run_time', 'num_cores', 'memory_req']].drop_duplicates()
 
 # Create task templates for each unique configuration
 task_templates = {}
@@ -259,68 +272,48 @@ for _, config in unique_configs.iterrows():
 
 # Create tasks using the appropriate template
 tasks = []
-for row in full_tasks_df.itertuples():
+for row in remaining_long.itertuples():
     config_key = f"{row.max_run_time}_{row.num_cores}_{row.memory_req}"
     template = task_templates[config_key]
 
-    for relative_risk in RELATIVE_RISKS:
-        if relative_risk == "indirect_resp_draw":
-            sample_name = row.indirect_resp_draw
-        elif relative_risk == "indirect_cvd_draw":
-            sample_name = row.indirect_cvd_draw
-        else:
-            raise ValueError(f"Unexpected relative risk type: {relative_risk}")
+    # for relative_risk in RELATIVE_RISKS:
+    #     if relative_risk == "indirect_resp_draw":
+    #         sample_name = row.indirect_resp_draw
+    #     elif relative_risk == "indirect_cvd_draw":
+    #         sample_name = row.indirect_cvd_draw
+    #     else:
+    #         raise ValueError(f"Unexpected relative risk type: {relative_risk}")
 
-        task = template.create_task(
-            name=(
-                f"CLIMADA_stage2_"
-                f"sd{row.storm_draw}_"
-                f"src{row.source_id}_"
-                f"var{row.variant_label}_"
-                f"exp{row.experiment_id}_"
-                f"yr{row.batch_year}_"
-                f"{row.basin}_"
-                f"{relative_risk}_"
-                f"{sample_name}_"
-                f"tracks{row.num_tracks}_"
-                f"rt{row.max_run_time}m_"
-                f"mem{row.memory_req}_"
-                f"c{row.num_cores}"
-            ),
-            storm_draw=row.storm_draw,
-            source_id=row.source_id,
-            variant_label=row.variant_label,
-            experiment_id=row.experiment_id,
-            batch_year=row.batch_year,
-            basin=row.basin,
-            relative_risk=relative_risk,
-            sample_name=sample_name,
-            num_cores=row.num_cores,
-        )
+    task = template.create_task(
+        name=(
+            f"CLIMADA_stage2_"
+            f"sd{row.storm_draw}_"
+            f"src{row.source_id}_"
+            f"var{row.variant_label}_"
+            f"exp{row.experiment_id}_"
+            f"yr{row.batch_year}_"
+            f"{row.basin}_"
+            f"{row.relative_risk}_"
+            f"{row.sample_name}_"
+            f"rt{row.max_run_time}m_"
+            f"mem{row.memory_req}_"
+            f"c{row.num_cores}"
+        ),
+        storm_draw=row.storm_draw,
+        source_id=row.source_id,
+        variant_label=row.variant_label,
+        experiment_id=row.experiment_id,
+        batch_year=row.batch_year,
+        basin=row.basin,
+        relative_risk=row.relative_risk,
+        sample_name=row.sample_name,
+        num_cores=row.num_cores,
+    )
 
-        tasks.append(task)
+    tasks.append(task)
 
 print(f"Number of tasks: {len(tasks)}")
 print(f"Number of task templates created: {len(task_templates)}")
-
-# df = pd.read_csv("/mnt/share/homes/mfiking/downloads/jobmon_workflows/stage2/Jobmon_Workflow_549172_Tasks.csv")
-# df2 = pd.read_csv("/mnt/share/homes/mfiking/downloads/jobmon_workflows/stage2/Jobmon_Workflow_549172_Tasks2.csv")
-# df3 = pd.read_csv("/mnt/share/homes/mfiking/downloads/jobmon_workflows/stage2/Jobmon_Workflow_550436_Tasks.csv")
-# df4 = pd.read_csv("/mnt/share/homes/mfiking/downloads/jobmon_workflows/stage2/Jobmon_Workflow_550436_Tasks2.csv")
-# df5 = pd.read_csv("/mnt/share/homes/mfiking/downloads/jobmon_workflows/stage2/Jobmon_Workflow_550510_Tasks.csv")
-# df6 = pd.read_csv("/mnt/share/homes/mfiking/downloads/jobmon_workflows/stage2/Jobmon_Workflow_550510_Tasks2.csv")
-
-# full_df = pd.concat([df5, df6])
-
-# full_df = full_df[full_df["task_status"] != "DONE"]
-
-# # convert dataframe column to set for fast lookup
-# commands_to_rerun = set(full_df["task_command"])
-# # subset tasks
-# tasks_to_rerun = [task for task in tasks if task.command in commands_to_rerun]
-
-# print(f"Original tasks: {len(tasks)}")
-# print(f"Tasks to rerun: {len(tasks_to_rerun)}")
 
 if tasks:
     workflow.add_tasks(tasks)
