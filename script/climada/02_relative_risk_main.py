@@ -1,24 +1,19 @@
 from pathlib import Path
+from typing import NamedTuple
 import xarray as xr  # type: ignore
 import numpy as np  # type: ignore
-import rasterra as rt # type: ignore
+import rasterra as rt  # type: ignore
 import pandas as pd  # type: ignore
 from scipy.interpolate import interp1d  # type: ignore
-import geopandas as gpd  # type: ignore
-from shapely.geometry import Point, box, mapping  # type: ignore
 from affine import Affine  # type: ignore
 import os
-import warnings
-from collections.abc import Iterator
 import argparse
-import zarr # type: ignore
-import dask.array as da  # type: ignore
 import gc
 import re
-from rra_tools.parallel import run_parallel  # type: ignore
 import time
+import traceback
+from rra_tools.parallel import run_parallel  # type: ignore
 from rasterra import RasterArray  # type: ignore
-from typing import NamedTuple
 
 parser = argparse.ArgumentParser(description="Run CLIMADA code")
 
@@ -48,92 +43,20 @@ num_cores = args.num_cores
 # Constants
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2")
 SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2")
-ERROR_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2_storm_errors")
+
+# Fixed impact duration per storm-affected pixel (days), expressed as a
+# year-fraction for the PAF formula: PAF = (RR - 1) / RR * (days / 365).
+# Previously materialized as a per-storm raster filled with 20.0 inside the
+# storm footprint, resampled to the basin template, and indexed by mask;
+# the mask reduces to `rr > 0` and the value is constant, so we just use
+# the precomputed fraction directly.
+IMPACT_DAYS_FRACTION = 20.0 / 365.0
 
 class StormMeta(NamedTuple):  # type: ignore
     storm_path: Path
     start_year: int
     end_year: int
     storm_id: str
-
-def iter_storms_metadata_debug(draw_store: Path, error_dir: Path = ERROR_DIR) -> list[StormMeta]:
-    """
-    Return a list of StormMeta for each storm in the draw, without loading full data.
-    Logs all storms with errors to a single CSV file and raises an error if any are found.
-    """
-    if not draw_store.exists():
-        raise FileNotFoundError(f"Draw store not found: {draw_store}")
-
-    storm_paths = sorted(
-        p for p in draw_store.iterdir() if p.is_dir() and p.name.startswith("storm_")
-    )
-
-    storms_meta = []
-    error_list = []
-
-    for storm_path in storm_paths:
-        try:
-            ds = xr.open_zarr(storm_path, consolidated=False, chunks={})  # lazy read, no load
-            start_year = pd.to_datetime(ds.attrs["start_date"]).year
-            end_year = pd.to_datetime(ds.attrs["end_date"]).year
-            storm_id = ds.attrs.get("storm_id", storm_path.name)
-            storms_meta.append(StormMeta(storm_path, start_year, end_year, storm_id))
-        except Exception as e:
-            storm_id = storm_path.name
-            error_list.append({"draw_store": str(draw_store), "storm_id": storm_id, "error": str(e)})
-        finally:
-            try:
-                ds.close()
-            except Exception:
-                pass
-
-    # If there were any errors, save them
-    if error_list:
-        error_dir.mkdir(parents=True, exist_ok=True)
-
-        # Extract metadata from path
-        parts = draw_store.parts
-        source_id = parts[-7]
-        variant_label = parts[-6]
-        experiment_id = parts[-5]
-        batch_year = parts[-4]
-        basin = parts[-3]
-
-        # Extract draw from filename
-        name = draw_store.name
-        if "_e" in name:
-            draw = int(name.split("_e")[-1].replace(".zarr", "")) + 1
-        else:
-            draw = 0
-
-        # Build dataframe
-        df = pd.DataFrame(error_list)
-        df["source_id"] = source_id
-        df["variant_label"] = variant_label
-        df["experiment_id"] = experiment_id
-        df["batch_year"] = batch_year
-        df["basin"] = basin
-        df["draw"] = draw
-
-        df = df[
-            [
-                "source_id",
-                "variant_label",
-                "experiment_id",
-                "batch_year",
-                "basin",
-                "draw",
-                "storm_id",
-                "error",
-            ]
-        ]
-
-        error_file = error_dir / f"{draw_store.name}_storm_errors.parquet"
-        df.to_parquet(error_file, index=False)
-
-    return storms_meta
-
-
 
 def iter_storms_metadata(draw_store: Path) -> list[StormMeta]:
     """Return a list of StormMeta for each storm in the draw, without loading full data."""
@@ -146,12 +69,16 @@ def iter_storms_metadata(draw_store: Path) -> list[StormMeta]:
 
     storms_meta = []
     for storm_path in storm_paths:
-        ds = xr.open_zarr(storm_path, consolidated=False, chunks={})  # lazy read, no load
-        start_year = pd.to_datetime(ds.attrs["start_date"]).year
-        end_year = pd.to_datetime(ds.attrs["end_date"]).year
-        storm_id = ds.attrs.get("storm_id", storm_path.name)
-        storms_meta.append(StormMeta(storm_path, start_year, end_year, storm_id))
-        ds.close()  # close immediately to avoid keeping file handles open
+        ds = None
+        try:
+            ds = xr.open_zarr(storm_path, consolidated=False, chunks={})  # lazy read, no load
+            start_year = pd.to_datetime(ds.attrs["start_date"]).year
+            end_year = pd.to_datetime(ds.attrs["end_date"]).year
+            storm_id = ds.attrs.get("storm_id", storm_path.name)
+            storms_meta.append(StormMeta(storm_path, start_year, end_year, storm_id))
+        finally:
+            if ds is not None:
+                ds.close()
     return storms_meta
 
 def map_storms_to_years(storms_meta: list[StormMeta], years: list[int]):
@@ -175,30 +102,23 @@ def normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def ensure_min_grid(da: xr.DataArray, buffer_deg: float = 0.1) -> xr.DataArray:
+def ensure_min_grid(
+    da: "xr.DataArray | xr.Dataset",
+    buffer_deg: float = 0.1,
+) -> "xr.DataArray | xr.Dataset":
+    """
+    Pad a single-pixel lat/lon dimension with NaN neighbors so rasterization
+    sees at least a 3-cell axis. Works for both DataArray and Dataset.
+    """
     if da.lat.size == 1:
         c = float(da.lat.values[0])
-        da = da.reindex(lat=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
+        da = da.reindex(lat=[c-buffer_deg, c, c+buffer_deg], fill_value=np.nan)
 
     if da.lon.size == 1:
         c = float(da.lon.values[0])
-        da = da.reindex(lon=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
+        da = da.reindex(lon=[c-buffer_deg, c, c+buffer_deg], fill_value=np.nan)
 
     return da
-
-
-def chmod_recursive(path: Path, mode: int = 0o775):
-    for root, dirs, files in os.walk(path):
-        for d in dirs:
-            os.chmod(os.path.join(root, d), mode)
-        for f in files:
-            os.chmod(os.path.join(root, f), mode)
-
-
-def iter_storms(draw_store: Path):
-    for storm_path in draw_store.iterdir():
-        if storm_path.is_dir() and storm_path.name.startswith("storm_"):
-            yield xr.open_zarr(storm_path, consolidated=False)
 
 
 def to_raster(
@@ -261,116 +181,80 @@ def knots_to_ms(knots):
     """
     return knots * 0.514444
 
-def interpolate_rr_from_windspeed(intensity_array, rr_samples_df, sample_name, min_windspeed_knots=25):
+class RRInterpolator(NamedTuple):
     """
-    Interpolate relative risk values for windspeed intensity array using a specific sample.
-    
-    Parameters:
-    -----------
-    intensity_array : xarray.DataArray
-        Wind intensity values in m/s
-    rr_samples_df : pandas.DataFrame
-        DataFrame with windspeed (knots), type, and sample columns
-    sample_name : str
-        Name of the sample column to use (e.g., 'sample_001')
-    min_windspeed_knots : float
-        Minimum windspeed threshold in knots (default: 25)
-        
-    Returns:
-    --------
-    xarray.DataArray
-        Relative risk values interpolated for the intensity array
+    Pre-built relative-risk interpolation context, shared across all storms
+    in a single draw. Built once at the top of `process_single_draw` so
+    every storm in that draw reuses the same `interp1d` callable and bounds
+    instead of rebuilding them.
     """
-    
-    # Convert minimum windspeed to m/s for comparison
-    min_windspeed_ms = knots_to_ms(min_windspeed_knots)
-    
-    # Get windspeed and RR values from the sample
-    windspeed_knots = rr_samples_df['windspeed'].values
-    windspeed_ms = knots_to_ms(windspeed_knots)
+    interp: object       # interp1d callable over windspeed_ms -> RR
+    min_ms: float        # lowest windspeed in the RR table (m/s)
+    max_ms: float        # highest windspeed in the RR table (m/s)
+    max_rr: float        # RR value at the highest windspeed (used as a cap)
+    sample_name: str     # column name in rr_samples_df, kept for metadata
+
+
+def build_rr_interpolator(
+    rr_samples_df: pd.DataFrame,
+    sample_name: str,
+) -> RRInterpolator:
+    """Construct the per-draw RR interpolation context."""
+    windspeed_ms = knots_to_ms(rr_samples_df["windspeed"].values)
     rr_values = rr_samples_df[sample_name].values
-    
-    # Create interpolation function
-    rr_interp = interp1d(
-        windspeed_ms, 
-        rr_values, 
-        kind='linear', 
-        bounds_error=False, 
-        fill_value='extrapolate'
+
+    interp = interp1d(
+        windspeed_ms,
+        rr_values,
+        kind="linear",
+        bounds_error=False,
+        fill_value="extrapolate",
     )
-    
-    # Create copy to preserve coordinates and metadata
-    result = intensity_array.copy()
-    
-    # Get min and max windspeed values from RR data
-    min_rr_windspeed_ms = windspeed_ms.min()
-    max_rr_windspeed_ms = windspeed_ms.max()
-    max_rr_value = rr_values[np.argmax(windspeed_ms)]  # RR value at highest windspeed
-    
-    # Initialize all values to 0
-    rr_interpolated = np.zeros_like(intensity_array.values)
-    
-    # Create masks for different windspeed ranges
-    below_min_mask = intensity_array.values < min_rr_windspeed_ms
-    above_max_mask = intensity_array.values > max_rr_windspeed_ms
-    interpolation_mask = (intensity_array.values >= min_rr_windspeed_ms) & (intensity_array.values <= max_rr_windspeed_ms)
-    
-    # Set values below minimum to 0 (already initialized to 0)
-    # rr_interpolated[below_min_mask] = 0  # Already 0
-    
-    # Set values above maximum to the highest RR value
+
+    return RRInterpolator(
+        interp=interp,
+        min_ms=float(windspeed_ms.min()),
+        max_ms=float(windspeed_ms.max()),
+        max_rr=float(rr_values[np.argmax(windspeed_ms)]),
+        sample_name=sample_name,
+    )
+
+
+def interpolate_rr_from_windspeed(
+    intensity_array: xr.DataArray,
+    rr_ctx: RRInterpolator,
+) -> xr.DataArray:
+    """
+    Interpolate relative risk for a windspeed intensity array (m/s) using a
+    pre-built RR interpolation context. Pixels outside the RR table's
+    windspeed range get 0 (below min) or the table's max RR (above max).
+    """
+    intensity_values = intensity_array.values
+    rr_interpolated = np.zeros_like(intensity_values)
+
+    above_max_mask = intensity_values > rr_ctx.max_ms
+    interpolation_mask = (
+        (intensity_values >= rr_ctx.min_ms) & (intensity_values <= rr_ctx.max_ms)
+    )
+
     if np.any(above_max_mask):
-        rr_interpolated[above_max_mask] = max_rr_value
-    
-    # Interpolate values within the RR data range
+        rr_interpolated[above_max_mask] = rr_ctx.max_rr
+
     if np.any(interpolation_mask):
-        rr_values_interp = rr_interp(intensity_array.values[interpolation_mask])
-        rr_interpolated[interpolation_mask] = rr_values_interp
-    
-    # Update the data array values
-    result.values = rr_interpolated
-    result.name = f"relative_risk_{sample_name}"
-    
-    return result
-    
-def all_years_in_draw(draw_store: Path) -> list[int]:
-    """
-    Get all unique years covered by storms in a draw.
+        rr_interpolated[interpolation_mask] = rr_ctx.interp(
+            intensity_values[interpolation_mask]
+        )
 
-    Parameters
-    ----------
-    draw_store : Path
-        Path to the draw-level Zarr store.
-
-    Returns
-    -------
-    list[int]
-        Sorted list of years present in the storms.
-    """
-    years = set()
-    for storm_ds in iter_storms(draw_store):
-        storm_start = pd.to_datetime(storm_ds.attrs["start_date"])
-        storm_end = pd.to_datetime(storm_ds.attrs["end_date"])
-        storm_years = range(storm_start.year, storm_end.year + 1)
-        years.update(storm_years)
-    return sorted(years)
-
-def storm_primary_year(storm_ds: xr.Dataset) -> int:
-    """
-    Return the primary year of a storm, defined as the start_date year.
-
-    Parameters
-    ----------
-    storm_ds : xr.Dataset
-        A single storm dataset.
-
-    Returns
-    -------
-    int
-        Year of storm start_date.
-    """
-    return pd.to_datetime(storm_ds.attrs["start_date"]).year
-
+    # Construct a fresh DataArray with the same coords/dims/attrs as the input.
+    # dict(intensity_array.attrs) makes a shallow copy so downstream attr
+    # mutation (in generate_relative_risk) doesn't bleed into the source DA.
+    return xr.DataArray(
+        rr_interpolated,
+        coords=intensity_array.coords,
+        dims=intensity_array.dims,
+        attrs=dict(intensity_array.attrs),
+        name=f"relative_risk_{rr_ctx.sample_name}",
+    )
 def generate_basin_template_raster(basin, res=0.1, buffer_deg=5.0):
     basin_bounds = {
         'EP': ['180E', '0N', '290E', '60N'],
@@ -469,30 +353,7 @@ def get_draw_zarr_path(
 
     return draw_store
 
-def iter_storms_from_draw(draw_store: Path) -> Iterator[xr.Dataset]:
-    """
-    Lazily iterate over storm_* Zarr groups in a draw.
-
-    Each yielded Dataset represents a single storm.
-    """
-    if not draw_store.exists():
-        raise FileNotFoundError(f"Draw store not found: {draw_store}")
-
-    storm_paths = sorted(
-        p for p in draw_store.iterdir()
-        if p.is_dir() and p.name.startswith("storm_")
-    )
-
-    for storm_path in storm_paths:
-        yield xr.open_zarr(
-            storm_path,
-            consolidated=False,
-            chunks="auto",   # critical for raster ops
-        )
-
-
-
-def load_relative_risk_df(relative_risk: str,root: Path = Path("/mnt/share/homes/mfiking/github_repos/climada_python/data/")):
+def load_relative_risk_df(relative_risk: str,root: Path = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/relative_risk_samples/")):
 
     if relative_risk == "indirect_resp_draw":
         relative_risk_df = pd.read_csv(root / f"rd_rr_samples.csv")
@@ -502,152 +363,35 @@ def load_relative_risk_df(relative_risk: str,root: Path = Path("/mnt/share/homes
     return relative_risk_df
 
 
-def generate_days_impact_from_intensity(
-    intensity_da: xr.DataArray,
-    impact_days: float = 20.0,
-) -> xr.DataArray:
-    """
-    Create synthetic days_impact raster from intensity.
-
-    Valid intensity pixels → impact_days
-    Invalid / zero intensity → 0
-    """
-
-    data = intensity_da.values
-
-    # Define impacted pixels
-    mask = np.isfinite(data) & (data > 0)
-
-    days = np.zeros_like(data, dtype=np.float32)
-    days[mask] = impact_days
-
-    da_days = xr.DataArray(
-        days,
-        coords=intensity_da.coords,
-        dims=intensity_da.dims,
-        name="days_impact",
-        attrs=intensity_da.attrs,
-    )
-
-    da_days.attrs.update({
-        "description": "Synthetic impact duration derived from intensity mask",
-        "impact_days_assumed": impact_days,
-        "definition": "Pixels with valid windspeed assigned fixed duration",
-    })
-
-    return da_days
-
-##########################################
-#     Subset Raster to Affected Area     #
-##########################################
-
-def subset_affected_area(
-    rr_raster: rt.RasterArray,
-    threshold: float = 0.0,
-) -> rt.RasterArray:
-    """
-    Subset a RasterArray to the minimal bounding box
-    where RR > threshold, using rasterra.clip().
-
-    Parameters
-    ----------
-    rr_raster : RasterArray
-        Storm relative risk raster.
-    threshold : float
-        Threshold defining affected pixels.
-
-    Returns
-    -------
-    RasterArray
-        Subset raster clipped to affected area.
-    """
-    data = np.asarray(rr_raster.data)
-
-    mask = np.isfinite(data) & (data > threshold)
-    if not np.any(mask):
-        raise ValueError("No affected pixels found (RR > threshold).")
-
-    rows, cols = np.where(mask)
-
-    transform = rr_raster.transform
-    a, b, c, d, e, f = transform[:6]
-
-    # Pixel → coordinate conversion
-    xmin = c + cols.min() * a
-    xmax = c + (cols.max() + 1) * a
-    ymax = f + rows.min() * e
-    ymin = f + (rows.max() + 1) * e
-
-    # Build geometry
-    geom = box(xmin, ymin, xmax, ymax)
-    gdf = gpd.GeoDataFrame(geometry=[geom], crs=rr_raster.crs)
-
-
-    # Native rasterra clip
-    return rr_raster.clip(gdf)
-
 ##########################################
 #        Calculate Relative Risk         #
 ##########################################
 
 def generate_relative_risk(
     da_intensity: xr.DataArray,
-    rr_samples_df,
-    sample_name: str,
-    min_windspeed_knots: float = 25.0,
+    rr_ctx: RRInterpolator,
 ) -> xr.DataArray:
     """
-    Generate per-storm pixel-level relative risk from storm intensity.
-
-    Parameters
-    ----------
-    storm_intensity : xr.DataArray
-        Each DataArray has dims ('lat', 'lon') and values in m/s.
-        Represents per-pixel maximum wind speed during the storm.
-    rr_samples_df : pandas.DataFrame
-        Relative risk lookup table with 'windspeed' column in knots
-        and sample columns (e.g. 'sample_001').
-    sample_name : str
-        Column name in rr_samples_df to use.
-    min_windspeed_knots : float
-        Minimum windspeed threshold below which RR = 0.
-
-    Returns
-    -------
-    list[xr.DataArray]
-        One DataArray per storm with dims ('lat', 'lon').
+    Generate per-storm pixel-level relative risk from storm intensity using
+    the pre-built per-draw RR interpolation context.
     """
+    storm_name = da_intensity.attrs.get("storm_name", "none")
 
-    try:
-        storm_name = da_intensity.attrs["storm_name"]
-    except KeyError:
-        storm_name = "none"
-    
-    # Interpolate RR from windspeed (Katrina logic)
-    da_rr = interpolate_rr_from_windspeed(
-        intensity_array=da_intensity,
-        rr_samples_df=rr_samples_df,
-        sample_name=sample_name,
-        min_windspeed_knots=min_windspeed_knots,
-    )
+    da_rr = interpolate_rr_from_windspeed(da_intensity, rr_ctx)
 
     da_rr.attrs.update({
-        "description": (
-            "Pixel-level relative risk derived from storm maximum wind speed"
-        ),
+        "description": "Pixel-level relative risk derived from storm maximum wind speed",
         "storm_name": storm_name,
         "start_date": da_intensity.attrs.get("start_date"),
         "end_date": da_intensity.attrs.get("end_date"),
         "basin": da_intensity.attrs.get("basin"),
         "category": da_intensity.attrs.get("category"),
-        "rr_sample": sample_name,
-        "min_windspeed_knots": min_windspeed_knots,
+        "rr_sample": rr_ctx.sample_name,
         "definition": (
             "Relative risk interpolated from windspeed using empirical RR curves; "
             "intensity is maximum per-pixel wind speed during storm lifetime"
         ),
     })
-
 
     return da_rr
 
@@ -724,6 +468,9 @@ def save_raster(
                 time.sleep(retry_delay)
             else:
                 raise RuntimeError(f"Failed to save {save_path} after {max_retries} attempts") from e
+
+    return save_path
+
 
 def _is_valid_raster(path: Path) -> bool:
     try:
@@ -838,9 +585,11 @@ def process_single_draw(draw):
         rr_samples_df,
         invalid_years,
     ) = draw
-    
-    # Create template raster for this basin
-    # template_raster = generate_basin_template_raster(basin, res=0.1)
+
+    # Build the RR interpolation context once per worker (per draw). Every
+    # storm in this draw reuses the same interp1d + bounds instead of
+    # rebuilding them per storm.
+    rr_ctx = build_rr_interpolator(rr_samples_df, sample_name)
 
     # Path to the intensity draw
     intensity_draw_store = get_draw_zarr_path(
@@ -852,7 +601,6 @@ def process_single_draw(draw):
         draw=draw,
         metric="intensity",
     )
-    # print(f"intensity_draw: {intensity_draw_store}")
 
     # If no intensity data exists, return empty rasters
     if intensity_draw_store is None or not any(intensity_draw_store.iterdir()):
@@ -871,7 +619,6 @@ def process_single_draw(draw):
 
     # --- STEP 2: Process each year individually ---
     for year in invalid_years:
-        # print(f"Processing year: {year}")
         storm_paths_in_year = storms_by_year[year]
 
         # Skip years with no storms
@@ -882,65 +629,52 @@ def process_single_draw(draw):
         # Initialize cumulative arrays for this year
         sum_raw_paf = np.zeros_like(template_raster._ndarray, dtype=np.float32)
 
-        # Sort storms by start date (optional)
-        # storm_paths_in_year = sorted(
-        #     storm_paths_in_year,
-        #     key=lambda p: pd.to_datetime(xr.open_zarr(p, consolidated=False, chunks={}).attrs["start_date"])
-        # )
-
         # --- STEP 3: Process each storm ---
         for storm_path in storm_paths_in_year:
-            # Open storm lazily
-            storm_ds = xr.open_zarr(storm_path, consolidated=False, chunks="auto")
-            storm_ds = ensure_min_grid(storm_ds)  # Ensure minimum 3x3 grid for raster operations
-            storm_id = storm_ds.attrs.get("storm_id", storm_path.name)
-            # print(f"Storm: {storm_id}")
+            storm_id = storm_path.name  # fallback identifier if open fails
+            try:
+                with xr.open_zarr(storm_path, consolidated=False, chunks="auto") as storm_ds:
+                    storm_ds = ensure_min_grid(storm_ds)
+                    storm_id = storm_ds.attrs.get("storm_id", storm_path.name)
 
-            # normalize dataset if basin = NA and if needed
-            if basin == "NA":
-                storm_ds = normalize_dataset(storm_ds)
-                
-            # Compute RR and days impact
-            rr_da = generate_relative_risk(
-                da_intensity=storm_ds["intensity"],
-                rr_samples_df=rr_samples_df,
-                sample_name=sample_name,
-            )
-            rr_da = rr_da.where(rr_da > 0)
+                    if basin == "NA":
+                        storm_ds = normalize_dataset(storm_ds)
 
-            storm_rr = to_raster(
-                ds=rr_da,
-                no_data_value=np.nan,
-                lat_col="lat",
-                lon_col="lon",
-                crs="EPSG:4326"
-            ).resample_to(target=template_raster, resampling="nearest")
-            rr_values = storm_rr._ndarray
+                    rr_da = generate_relative_risk(
+                        da_intensity=storm_ds["intensity"],
+                        rr_ctx=rr_ctx,
+                    )
+                    rr_da = rr_da.where(rr_da > 0)
 
-            storm_days_impact = to_raster(
-                ds=generate_days_impact_from_intensity(storm_ds["intensity"], impact_days=20.0),
-                no_data_value=0,
-                lat_col="lat",
-                lon_col="lon",
-                crs="EPSG:4326"
-            ).resample_to(target=template_raster, resampling="nearest")
-            t_impact = storm_days_impact._ndarray
+                    storm_rr = to_raster(
+                        ds=rr_da,
+                        no_data_value=np.nan,
+                        lat_col="lat",
+                        lon_col="lon",
+                        crs="EPSG:4326",
+                    ).resample_to(target=template_raster, resampling="nearest")
+                    rr_values = storm_rr._ndarray
 
-            # Mask valid pixels
-            mask = np.isfinite(t_impact) & np.isfinite(rr_values) & (t_impact > 0) & (rr_values != 0)
-            if not mask.any():
-                del storm_rr, storm_days_impact, rr_values, t_impact, mask
-                storm_ds.close()
-                del storm_ds
+                    # Pixels with a positive, finite RR contribute. NumPy `>`
+                    # returns False on NaN, so `rr_values > 0` already excludes
+                    # the NaN pixels from `where(rr_da > 0)` above.
+                    mask = rr_values > 0
+                    if mask.any():
+                        # Every masked pixel sees a constant 20-day impact, so
+                        # the year-fraction collapses to IMPACT_DAYS_FRACTION.
+                        sum_raw_paf[mask] += (
+                            (rr_values[mask] - 1) / rr_values[mask] * IMPACT_DAYS_FRACTION
+                        )
+
+                    del storm_rr, mask, rr_values, rr_da
+            except Exception as e:
+                print(
+                    f"❌ Storm {storm_id} failed in draw {draw} "
+                    f"({source_id}/{variant_label}/{experiment_id}/{batch_year}/"
+                    f"{basin}, year {year}): {type(e).__name__}: {e}"
+                )
+                traceback.print_exc()
                 continue
-
-            # Compute raw PAF
-            sum_raw_paf[mask] += (rr_values[mask] - 1) / rr_values[mask] * (t_impact[mask] / 365)
-
-            # Clean up
-            del storm_rr, storm_days_impact, t_impact, mask, rr_values
-            storm_ds.close()
-            del storm_ds
 
         # End of year calculations
         yearly_paf[year] = sum_raw_paf
@@ -1044,7 +778,7 @@ def main(
         )
         print(f"Parallel job stage done for draw_batch: {batch_draws}")
 
-        # # batch_results is a list of yearly_paf dictionaries returned from each draw
+        # batch_results is a list of yearly_paf dictionaries returned from each draw
         for draw_yearly_paf in batch_results:
             for year in invalid_years:
                 arr = draw_yearly_paf.get(year)
@@ -1055,11 +789,13 @@ def main(
     n_draws = len(draws)
     final_paf = {year: arr / n_draws for year, arr in cumulative_paf.items()}
 
-    # Save to disk per year
+    # Save to disk per year, collecting the written paths for a single chmod
+    # sweep at the end (avoids one os.walk per year).
+    saved_paths: list[Path] = []
     for year in invalid_years:
         arr = final_paf[year]
 
-        save_raster(
+        save_path = save_raster(
             raster_data=arr,
             template_raster=template_raster,
             storm_draw=storm_draw,
@@ -1074,10 +810,17 @@ def main(
             metric="raw_paf",
             save_root=save_root,
         )
+        saved_paths.append(save_path)
 
-        # Fix permissions
-        out_path = save_root / storm_draw / source_id / variant_label / experiment_id / batch_year / str(year) / basin / "raw_paf"
-        chmod_recursive(out_path, mode=0o775)
+    # Fix permissions on the files we wrote (and their immediate parents so
+    # the group can traverse). No recursive walk needed — we know exactly
+    # which paths exist.
+    for path in saved_paths:
+        try:
+            os.chmod(path, 0o664)
+            os.chmod(path.parent, 0o775)
+        except Exception as e:
+            print(f"⚠️ Could not set permissions for {path}: {e}")
 
     print(f"Completed all draws for basin {basin}, batch {batch_year}")
 

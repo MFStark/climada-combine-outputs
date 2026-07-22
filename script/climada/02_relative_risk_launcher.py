@@ -1,19 +1,62 @@
-import getpass
 import uuid
-import pandas as pd # type: ignore
-from jobmon.client.status_commands import workflow_tasks, task_status # type: ignore
-from jobmon.client.tool import Tool # type: ignore
+import pandas as pd  # type: ignore
+from jobmon.client.tool import Tool  # type: ignore
 from pathlib import Path
-
-from zarr import full
-from rra_tools.parallel import run_parallel # type: ignore
-import xarray as xr # type: ignore
 import numpy as np
-import math 
 
 RELATIVE_RISKS = ["indirect_resp_draw", "indirect_cvd_draw"]
 
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2/")
+
+
+def _stage2_paf_path(
+    storm_draw: str,
+    source_id: str,
+    variant_label: str,
+    experiment_id: str,
+    batch_year: str,
+    basin: str,
+    relative_risk: str,
+    sample_name: str,
+    year: int,
+) -> Path:
+    """Path to a single year's raw_paf GeoTIFF. Must match the format
+    written by `save_raster` in 02_relative_risk_main.py."""
+    start_year, end_year = batch_year.split("-")
+    return (
+        SAVE_ROOT
+        / storm_draw / source_id / variant_label / experiment_id
+        / batch_year / str(year) / basin / "raw_paf"
+        / (
+            f"draw_mean_raw_paf_{storm_draw}_{relative_risk}_{sample_name}_"
+            f"{basin}_{source_id}_{experiment_id}_{variant_label}_"
+            f"{start_year}01_{end_year}12_{year}.tif"
+        )
+    )
+
+
+def task_is_complete(row) -> bool:
+    """A stage-2 task is complete iff every year in its batch_year has a
+    raw_paf GeoTIFF on disk that's at least 1 KB. Mirrors the existence +
+    size check in `check_if_draw_complete`; skips the load-validity check
+    (the main script's resume logic will catch and rebuild corrupt files)."""
+    start_year, end_year = map(int, row["batch_year"].split("-"))
+    for year in range(start_year, end_year + 1):
+        path = _stage2_paf_path(
+            storm_draw=row["storm_draw"],
+            source_id=row["source_id"],
+            variant_label=row["variant_label"],
+            experiment_id=row["experiment_id"],
+            batch_year=row["batch_year"],
+            basin=row["basin"],
+            relative_risk=row["relative_risk"],
+            sample_name=row["sample_name"],
+            year=year,
+        )
+        if not path.exists() or path.stat().st_size < 1024:
+            return False
+    return True
 
 # Read in paths
 meta_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/level_4_task_assignments.csv")
@@ -29,6 +72,8 @@ meta_df = meta_df.rename(columns={
     "time_period": "batch_year",
 })
 
+# Exclude the historical-baseline batch (1965-1969). Stage 2 runs on the
+# projection batches only; the baseline outputs come from a separate workflow.
 meta_df = meta_df[meta_df["batch_year"] != "1965-1969"]
 
 # read in storm draws
@@ -43,7 +88,11 @@ complete_df = meta_df.merge(
 # replace storm_draw as storm_draw_XXXX
 complete_df["storm_draw"] = complete_df["storm_draw"].apply(lambda x: f"storm_draw_{x:04d}")
 
-priority = [
+# Ordered list of high-priority storm_draws. These are submitted first when
+# PRIORITY_MODE == "priority"; submitted at the end of the queue when
+# PRIORITY_MODE == "non_priority"; and shipped in priority order when
+# PRIORITY_MODE == "all".
+PRIORITY_DRAWS = [
     "storm_draw_0002",
     "storm_draw_0004",
     "storm_draw_0005",
@@ -54,22 +103,32 @@ priority = [
     "storm_draw_0001",
 ]
 
-priority_map = {v: i for i, v in enumerate(priority)}
+# Which subset of storm_draws to submit. Change to flip the workflow.
+#   "non_priority" — submit everything EXCEPT PRIORITY_DRAWS (default state)
+#   "priority"     — submit ONLY PRIORITY_DRAWS (for testing / smoke runs)
+#   "all"          — submit every storm_draw, priority ones first
+PRIORITY_MODE = "all"
+
+priority_map = {v: i for i, v in enumerate(PRIORITY_DRAWS)}
 
 df = complete_df.copy()
+df["draw_order"] = df["storm_draw"].map(priority_map).fillna(len(PRIORITY_DRAWS))
+df = df.sort_values(
+    ["draw_order", "storm_draw", "source_id", "variant_label",
+     "experiment_id", "batch_year", "basin"]
+).drop(columns="draw_order")
 
-df["draw_order"] = df["storm_draw"].map(priority_map)
-
-# fill non-priority draws with large value → go last
-df["draw_order"] = df["draw_order"].fillna(len(priority))
-
-df = df.sort_values(["draw_order", "storm_draw", "source_id", "variant_label", "experiment_id", "batch_year", "basin"]).drop(columns="draw_order")
-
-# # subset to priority storm draws for testing
-# df = df[df["storm_draw"].isin(priority)]
-
-# subset to not the priority storm draws for complete run
-df = df[~df["storm_draw"].isin(priority)]
+if PRIORITY_MODE == "non_priority":
+    df = df[~df["storm_draw"].isin(PRIORITY_DRAWS)]
+elif PRIORITY_MODE == "priority":
+    df = df[df["storm_draw"].isin(PRIORITY_DRAWS)]
+elif PRIORITY_MODE == "all":
+    pass  # keep everything, priority-ordered
+else:
+    raise ValueError(
+        f"Invalid PRIORITY_MODE={PRIORITY_MODE!r}; "
+        f"expected one of: 'non_priority', 'priority', 'all'."
+    )
 
 #########################################################################################
 # assign runtime
@@ -97,65 +156,27 @@ final_df["memory_req"] = final_df["memory_req"].fillna("4G")
 final_df["num_cores"] = final_df["num_cores"].fillna(10)
 
 
-# round runtimes to 300, 600, 1200, 1800, 2700, 3600, 5700
-def round_runtime(x):
-    if x <= 300:
-        return 300
-    elif x <= 600:
-        return 600
-    elif x <= 1200:
-        return 1200
-    elif x <= 1800:
-        return 1800
-    elif x <= 2700:
-        return 2700
-    elif x <= 3600:
-        return 3600
-    else:
-        return 5700
-    
-final_df["max_run_time"] = final_df["max_run_time"].apply(round_runtime)
-# divide max runtimes by 60 to convert to minutes and round up
+# Vectorized runtime bucketing (seconds): right-edge bins map to a small set
+# of SLURM-friendly walltime ceilings. Values above 3600s fall into the 5700s
+# bucket.
+_RUNTIME_BIN_EDGES = [-float("inf"), 300, 600, 1200, 1800, 2700, 3600, float("inf")]
+_RUNTIME_BIN_VALUES = [300, 600, 1200, 1800, 2700, 3600, 5700]
+
+_bin_idx = pd.cut(
+    final_df["max_run_time"],
+    bins=_RUNTIME_BIN_EDGES,
+    labels=False,
+    include_lowest=True,
+)
+final_df["max_run_time"] = (
+    pd.Series(_RUNTIME_BIN_VALUES)[_bin_idx].to_numpy()
+)
+# Convert from seconds to whole minutes (SLURM walltime granularity).
 final_df["max_run_time"] = np.ceil(final_df["max_run_time"] / 60).astype(int)
 
 
 #########################################################################################
-workflow_id1 = 557853
-workflow_id2 = 557918
-workflow_id3 = 558362
-workflow_id4 = 558593
-workflow_id5 = 558645
-
-workflow_ids = [workflow_id1, workflow_id2, workflow_id3, workflow_id4, workflow_id5]
-
-total_df_list = []
-
-for workflow_id in workflow_ids:
-    df = workflow_tasks(
-        workflow_id=workflow_id,
-        limit=-1   # return all tasks
-    )
-    completed_df = df[df["STATUS"].isin(["COMPLETED", "D", "DONE", "Done"])]
-    total_df_list.append(completed_df)
-
-
-total_df = pd.concat(total_df_list, ignore_index=True)
-
-# Create completed parameters df
-parts = total_df["TASK_NAME"].str.split("_", expand=True)
-
-complete_parameters = pd.DataFrame({
-    "storm_draw": "storm_draw_" + parts[4],
-    "source_id": parts[5].str.removeprefix("src"),
-    "variant_label": parts[6].str.removeprefix("var"),
-    "experiment_id": parts[7].str.removeprefix("exp"),
-    "batch_year": parts[8].str.removeprefix("yr"),
-    "basin": parts[9],
-    "relative_risk": parts[10] + "_" + parts[11] + "_" + parts[12],
-    "sample_name": parts[13] + "_" + parts[14],
-})
-
-
+# Fan out (indirect_resp_draw, indirect_cvd_draw) into separate rows.
 rr_cols = ["indirect_cvd_draw", "indirect_resp_draw"]
 
 final_long = final_df.melt(
@@ -176,40 +197,37 @@ final_long = final_df.melt(
     value_name="sample_name",
 )
 
-remaining_long = final_long.merge(
-    complete_parameters,
-    on=[
-        "source_id",
-        "variant_label",
-        "experiment_id",
-        "batch_year",
-        "basin",
-        "storm_draw",
-        "relative_risk",
-        "sample_name",
-    ],
-    how="left",
-    indicator=True,
+############################################################################################
+# Completion derivation (filesystem-based, not Jobmon-based).
+#
+# A stage-2 task writes one raw_paf GeoTIFF per year in batch_year. A task is
+# complete iff every year's TIF exists and is at least 1 KB. We mirror that
+# check here per row of final_long and submit only rows whose 8-tuple isn't
+# already fully written. The main script's check_if_draw_complete /
+# get_year_status will handle the per-year recompute granularity inside any
+# task we do submit.
+completed_mask = final_long.apply(task_is_complete, axis=1)
+remaining_long = final_long[~completed_mask].copy()
+print(
+    f"Completion scan: {completed_mask.sum()} / {len(final_long)} tasks "
+    f"already done on disk; {len(remaining_long)} tasks to submit."
 )
 
-remaining_long = remaining_long[remaining_long["_merge"] == "left_only"].copy()
-
-# multiply max_run_time by 3
+# Reruns: triple the budgeted runtime relative to the resource_usage parquet.
+# (Empirical: invalidated single-year recomputes inside main() still re-run
+# all 100 inner draws, so we want headroom over the first-time-success budget.)
 remaining_long["max_run_time"] = remaining_long["max_run_time"] * 3
 
 
 ############################################################################################
 
-user = getpass.getuser()
-
-# Project
-project = "proj_rapidresponse"  # Adjust this to your project name if needed
-
-# create jobmon jobs
-user = getpass.getuser()
+project = "proj_rapidresponse"
 wf_uuid = uuid.uuid4()
 
-# Create a tool
+# Path to the worker script (resolved relative to this launcher so the repo
+# can be moved without breaking the command).
+MAIN_SCRIPT = Path(__file__).resolve().parent / "02_relative_risk_main.py"
+
 tool = Tool(name="CLIMADA_stage2")
 
 
@@ -253,7 +271,7 @@ for _, config in unique_configs.iterrows():
             "project": project,
         },
         command_template=(
-            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/02_relative_risk_main.py "
+            f"python {MAIN_SCRIPT} "
             "--storm_draw {storm_draw} "
             "--source_id {source_id} "
             "--variant_label {variant_label} "
@@ -275,14 +293,6 @@ tasks = []
 for row in remaining_long.itertuples():
     config_key = f"{row.max_run_time}_{row.num_cores}_{row.memory_req}"
     template = task_templates[config_key]
-
-    # for relative_risk in RELATIVE_RISKS:
-    #     if relative_risk == "indirect_resp_draw":
-    #         sample_name = row.indirect_resp_draw
-    #     elif relative_risk == "indirect_cvd_draw":
-    #         sample_name = row.indirect_cvd_draw
-    #     else:
-    #         raise ValueError(f"Unexpected relative risk type: {relative_risk}")
 
     task = template.create_task(
         name=(
@@ -323,12 +333,14 @@ else:
 
 try:
     workflow.bind()
-    print("✅ Workflow successfully bound.")
-    print(f"Running workflow with ID {workflow.workflow_id}.")
-    print("For full information see the Jobmon GUI:")
-    print(f"https://jobmon-gui.ihme.washington.edu/#/workflow/{workflow.workflow_id}")
 except Exception as e:
     print(f"❌ Workflow binding failed: {e}")
+    raise SystemExit(1)
+
+print("✅ Workflow successfully bound.")
+print(f"Running workflow with ID {workflow.workflow_id}.")
+print("For full information see the Jobmon GUI:")
+print(f"https://jobmon-gui.ihme.washington.edu/#/workflow/{workflow.workflow_id}")
 
 try:
     status = workflow.run()

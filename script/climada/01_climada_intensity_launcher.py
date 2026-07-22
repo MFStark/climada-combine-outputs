@@ -1,51 +1,19 @@
-import getpass
 import uuid
-import pandas as pd # type: ignore
-from jobmon.client.status_commands import workflow_tasks, task_status # type: ignore
-from jobmon.client.tool import Tool # type: ignore
 import pandas as pd  # type: ignore
+from jobmon.client.tool import Tool  # type: ignore
 from pathlib import Path
 import xarray as xr  # type: ignore
 from rra_tools.parallel import run_parallel  # type: ignore
-import os
 
+DRAWS_TOTAL = 100
+DRAWS_PER_BATCH = 5
 DRAW_BATCHES = [
-"0-4",
-"5-9",
-"10-14",
-"15-19",
-"20-24",
-"25-29",
-"30-34",
-"35-39",
-"40-44",
-"45-49",
-"50-54",
-"55-59",
-"60-64",
-"65-69",
-"70-74",
-"75-79",
-"80-84",
-"85-89",
-"90-94",
-"95-99",
+    f"{i}-{i + DRAWS_PER_BATCH - 1}"
+    for i in range(0, DRAWS_TOTAL, DRAWS_PER_BATCH)
 ]
 
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
-def parse_task_name(df: pd.DataFrame) -> pd.DataFrame:
-    # Split the task_name into components
-    components = df["task_name"].str.split("_", expand=True)
-    
-    # Assign components to new columns
-    task_df = df.copy()
-    task_df["source_id"] = components[2]
-    task_df["variant_label"] = components[3]
-    task_df["experiment_id"] = components[4]
-    task_df["batch_year"] = components[5]
-    task_df["basin"] = components[6]
-    task_df["draw_batch"] = components[7].str[1:]
-    return task_df[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]]
+
 
 def read_custom_tracks_nc(
     source_id: str,
@@ -100,32 +68,22 @@ def run_storm_count_parallel(task_df: pd.DataFrame) -> pd.DataFrame:
     )
     return task_df[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "num_tracks"]]
 
-def assign_run_time(row: pd.Series) -> pd.Series:
-    num_tracks = row["num_tracks"]
+def assign_run_resources(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vectorized resource assignment.
+    Fixed per-task: cores=5, memory=35G.
+    Runtime is binned from empirical performance + a 10-minute safety buffer.
+    """
+    df = df.copy()
+    df["num_cores"] = 5
+    df["memory_req"] = "35G"
 
-    # Fixed resources per task
-    row["num_cores"] = 5
-    row["memory_req"] = "35G"
-
-    # Runtime bins based on empirical performance
-    if num_tracks <= 15:
-        base_runtime = 40
-    elif num_tracks <= 30:
-        base_runtime = 50
-    elif num_tracks <= 70:
-        base_runtime = 80
-    elif num_tracks <= 120:
-        base_runtime = 120
-    elif num_tracks <= 180:
-        base_runtime = 190
-    else:
-        base_runtime = 250
-
-    # Safety buffer (protects against node variance)
-    runtime_buffer = 10
-    row["max_run_time"] = base_runtime + runtime_buffer
-
-    return row
+    # Right-open bins: (-inf, 15], (15, 30], (30, 70], (70, 120], (120, 180], (180, inf)
+    bin_edges = [-float("inf"), 15, 30, 70, 120, 180, float("inf")]
+    base_runtimes = [40, 50, 80, 120, 190, 250]
+    bin_idx = pd.cut(df["num_tracks"], bins=bin_edges, labels=False, include_lowest=True)
+    df["max_run_time"] = pd.Series(base_runtimes)[bin_idx].to_numpy() + 10
+    return df
 
 
 # Read in paths
@@ -148,7 +106,7 @@ meta_df = meta_df.rename(columns={
 meta_df_storm_counts = run_storm_count_parallel(meta_df)
 
 # Assign run times based on storm counts
-meta_df_storm_counts = meta_df_storm_counts.apply(assign_run_time, axis=1)
+meta_df_storm_counts = assign_run_resources(meta_df_storm_counts)
 
 # # Create full tasks by cross-joining with draw batches
 full_tasks_df = (
@@ -158,213 +116,87 @@ full_tasks_df = (
     .drop(columns=["key"])
 )
 
-#####################
-workflow_id1 = 554734
-workflow_id2 = 554955
-workflow_id3 = 555162
-workflow_id4 = 555247 
-workflow_id5 = 555408
-workflow_id6 = 555532 
-workflow_id7 = 555619 
-workflow_id8 = 555733
-workflow_id9 = 556078 
+######################################################################
+# Completion derivation (filesystem-based, not Jobmon-based).
+#
+# Stage 1's main script writes a per-draw JSON marker at
+#   <LOG_DIR>/draw_completion_markers/<source>/<variant>/<exp>/<batch_year>/<basin>/draw_NNNN.json
+# once a draw finishes. We treat the presence of every marker in a
+# draw_batch as the batch being done.
+#
+# Granularity note (see STAGES.md A2): if a batch crashed mid-way (e.g. 3/5
+# draws marked), the launcher reruns the WHOLE batch. The main script's
+# per-storm resume logic short-circuits the already-done draws inside it,
+# so cost is minimal — we just pay one task slot for the catch-up draws.
+######################################################################
+LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2_log/")
+MARKER_ROOT = LOG_DIR / "draw_completion_markers"
 
-workflow_ids = [workflow_id1, workflow_id2, workflow_id3, workflow_id4, workflow_id5, workflow_id6, workflow_id7, workflow_id8, workflow_id9]
+completed_draws: set[tuple] = set()
+if MARKER_ROOT.exists():
+    for marker in MARKER_ROOT.rglob("draw_*.json"):
+        parts = marker.relative_to(MARKER_ROOT).parts
+        # expected: (source_id, variant_label, experiment_id, batch_year, basin, "draw_NNNN.json")
+        if len(parts) != 6:
+            continue
+        try:
+            draw = int(parts[5].removeprefix("draw_").removesuffix(".json"))
+        except ValueError:
+            continue
+        completed_draws.add((parts[0], parts[1], parts[2], parts[3], parts[4], draw))
 
-total_df_list = []
 
-for workflow_id in workflow_ids:
-    df = workflow_tasks(
-        workflow_id=workflow_id,
-        limit=-1   # return all tasks
+def _batch_is_complete(row: pd.Series) -> bool:
+    """A draw_batch is complete iff every draw in it has a marker on disk."""
+    start, end = map(int, row["draw_batch"].split("-"))
+    key_prefix = (
+        row["source_id"], row["variant_label"], row["experiment_id"],
+        row["batch_year"], row["basin"],
     )
-    completed_df = df[df["STATUS"] == "D"]
-    total_df_list.append(completed_df)
+    return all((*key_prefix, d) in completed_draws for d in range(start, end + 1))
 
 
-total_df = pd.concat(total_df_list, ignore_index=True)
+_batch_done_mask = full_tasks_df.apply(_batch_is_complete, axis=1)
+remaining_meta = full_tasks_df[~_batch_done_mask].reset_index(drop=True)
 
-# Create completed parameters df
-parts = total_df["TASK_NAME"].str.split("_", expand=True)
-
-
-complete_parameters = pd.DataFrame({
-    "source_id": parts[2],
-    "variant_label": parts[3],
-    "experiment_id": parts[4],
-    "batch_year": parts[5],
-    "basin": parts[6],
-    "draw_batch": parts[7].str.removeprefix("d"),
-})
-
-
-complete_parameters = complete_parameters.merge(full_tasks_df, on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="inner")
-
-
-# drop complete parameters from full tasks to get remaining tasks
-
-remaining_meta = full_tasks_df.merge(complete_parameters[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]], on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"], how="left", indicator=True)
-remaining_meta = remaining_meta[remaining_meta["_merge"] == "left_only"].drop(columns=["_merge"])
-
-####################################################################3
-# ordering
-storm_draw_df = pd.read_csv("/mnt/team/rapidresponse/pub/tropical-storms/storm_draw_table.csv")
-storm_draw_df = storm_draw_df[["storm_draw", "source_id", "variant_label"]]
-
-combo_cols = ["source_id", "variant_label"]
-storm_draw_df["draw_rank_within_model"] = (
-    storm_draw_df
-    .sort_values("storm_draw")
-    .groupby(combo_cols)["storm_draw"]
-    .rank(method="dense")
-    .astype(int)
+print(
+    f"Completion scan: {_batch_done_mask.sum()} / {len(full_tasks_df)} batches "
+    f"already done on disk; {len(remaining_meta)} batches to submit."
 )
-storm_draw_df = storm_draw_df.sort_values(
-    [
-        "draw_rank_within_model",  # round-robin across models
-        "source_id",
-        "variant_label",
-        "storm_draw",
-    ]
-).reset_index(drop=True)
-storm_draw_df = storm_draw_df[:8]
-new_meta = remaining_meta.merge(
-    storm_draw_df,
-    on=["source_id", "variant_label"],
-    how="left"
+# ----------------------------------------------------------------------
+# Submission ordering
+#
+# Finish one (source_id, variant_label) combination fully before starting the
+# next. MRI-ESM2-0 carries many variant_labels relative to other sources, so
+# push it to the bottom so it doesn't dominate the front of the queue.
+# ----------------------------------------------------------------------
+DEPRIORITIZED_SOURCES = {"MRI-ESM2-0"}
+
+new_meta = remaining_meta.copy()
+new_meta["_deprio"] = new_meta["source_id"].isin(DEPRIORITIZED_SOURCES).astype(int)
+new_meta = (
+    new_meta
+    .sort_values(
+        [
+            "_deprio",
+            "source_id",
+            "variant_label",
+            "experiment_id",
+            "batch_year",
+            "basin",
+            "draw_batch",
+        ]
+    )
+    .drop(columns=["_deprio"])
+    .reset_index(drop=True)
 )
-new_meta = new_meta.sort_values(
-    [
-        "draw_rank_within_model",  # round-robin across models
-        "source_id",
-        "variant_label",
-        "storm_draw",
-        "experiment_id",
-        "batch_year",
-        "basin",
-        "draw_batch",
-        "memory_req",
-        "max_run_time",
-    ]
-).reset_index(drop=True)
 
-
-new_meta = new_meta.sort_values(
-    [
-        "storm_draw",
-        "source_id",
-        "variant_label",
-        "experiment_id",
-        "batch_year",
-        "basin",
-        "draw_batch",
-        "memory_req",
-        "max_run_time",
-    ]
-).reset_index(drop=True)
-
-
-
-#####################################################
-# round robin by strom draw and batch draws
-
-# combo_cols = ["source_id", "variant_label"]
-
-# combo_order = (
-#     new_meta[combo_cols]
-#     .drop_duplicates()
-#     .sort_values(combo_cols)
-#     .reset_index(drop=True)
-# )
-
-# combo_order["combo_rank"] = combo_order.index
-
-# new_meta = new_meta.merge(combo_order, on=combo_cols, how="left")
-
-# priority_batches = set(range(5))
-
-# new_meta["batch_priority"] = (
-#     ~new_meta["draw_batch"].isin(priority_batches)
-# ).astype(int)
-
-# new_meta = new_meta.sort_values(
-#     [
-#         "combo_rank",        # finish one combo before moving to next
-#         "batch_priority",    # draw_batch 0–5 first
-#         "draw_batch",        # ordered within priority
-#         "experiment_id",
-#         "batch_year",
-#         "basin",
-#         "draw_rank_within_model",  # stable ordering within combo
-#         "storm_draw",
-#         "memory_req",
-#         "max_run_time",
-#     ]
-# ).reset_index(drop=True)
-
-##########################################################
-# new_meta = new_meta[new_meta["draw_batch"].isin(["0-4"])]
-
-
-# # replace draw_batch 0-4 with "0-0" for simplicity in tracking
-# new_meta["draw_batch"] = "0-0"
-
-# # drop duplicate rows
-# new_meta = new_meta.drop_duplicates(subset=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]).copy()
-
-# # replace num cores to 1 because we will run sequentially for testing
-# new_meta["num_cores"] = 1
-
-# # replace memory requirement to 10G for testing
-# new_meta["memory_req"] = "30G"
-
-
-# workflow_id_new = 555679
-
-# df_new = workflow_tasks(
-#     workflow_id=workflow_id_new,
-#     limit=-1   # return all tasks
-# )
-
-# completed_df_new = df_new[df_new["STATUS"].isin(["D", "Done", "DONE"])]
-
-# parts_new = completed_df_new["TASK_NAME"].str.split("_", expand=True)
-# completed_parameters_new = pd.DataFrame({
-#     "source_id": parts_new[2],
-#     "variant_label": parts_new[3],
-#     "experiment_id": parts_new[4],
-#     "batch_year": parts_new[5],
-#     "basin": parts_new[6],
-#     "draw_batch": parts_new[7].str.removeprefix("d"),
-# })
-
-# completed_parameters_new = completed_parameters_new.merge(
-#     completed_parameters_new,
-#     on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"],
-#     how="inner"
-# )
-
-# remaining_meta_new = new_meta.merge(
-#     completed_parameters_new[["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"]],
-#     on=["source_id", "variant_label", "experiment_id", "batch_year", "basin", "draw_batch"],
-#     how="left",
-#     indicator=True
-# )
-
-# remaining_meta_new = remaining_meta_new[remaining_meta_new["_merge"] == "left_only"].drop(columns=["_merge"])
-
-# new_meta = remaining_meta_new.copy()
-
-#############################################################
-
-user = getpass.getuser()
-
-# Project
 project = "proj_rapidresponse"  # Adjust this to your project name if needed
-
-# create jobmon jobs
-user = getpass.getuser()
 wf_uuid = uuid.uuid4()
+
+# Path to the worker script (resolved relative to this launcher so the repo
+# can be moved without breaking the command).
+MAIN_SCRIPT = Path(__file__).resolve().parent / "01_climada_intensity_main.py"
 
 # Create a tool
 tool = Tool(name="CLIMADA_state1")
@@ -409,7 +241,7 @@ for _, config in unique_configs.iterrows():
             "project": project,
         },
         command_template=(
-            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/01_climada_intensity_main.py "
+            f"python {MAIN_SCRIPT} "
             "--source_id {source_id} "
             "--variant_label {variant_label} "
             "--experiment_id {experiment_id} "
@@ -454,12 +286,14 @@ else:
 
 try:
     workflow.bind()
-    print("✅ Workflow successfully bound.")
-    print(f"Running workflow with ID {workflow.workflow_id}.")
-    print("For full information see the Jobmon GUI:")
-    print(f"https://jobmon-gui.ihme.washington.edu/#/workflow/{workflow.workflow_id}")
 except Exception as e:
     print(f"❌ Workflow binding failed: {e}")
+    raise SystemExit(1)
+
+print("✅ Workflow successfully bound.")
+print(f"Running workflow with ID {workflow.workflow_id}.")
+print("For full information see the Jobmon GUI:")
+print(f"https://jobmon-gui.ihme.washington.edu/#/workflow/{workflow.workflow_id}")
 
 try:
     status = workflow.run()

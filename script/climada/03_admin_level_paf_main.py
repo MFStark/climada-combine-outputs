@@ -1,21 +1,26 @@
 from pathlib import Path
-import xarray as xr  # type: ignore
 import numpy as np  # type: ignore
 import os
-import rasterra as rt # type: ignore
+import rasterra as rt  # type: ignore
 import pandas as pd  # type: ignore
 from rasterio.features import shapes  # type: ignore
-from shapely.geometry import shape  # type: ignore
+from rasterio.errors import WindowError  # type: ignore
 import geopandas as gpd  # type: ignore
 import argparse
-import gc
-import rasterio  # type: ignore
+import traceback
 from rra_tools.parallel import run_parallel  # type: ignore
-from shapely.geometry import box
-import shapely
-from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, LineString
-from shapely.ops import split, unary_union
+import shapely  # type: ignore
+from shapely.geometry import (
+    box,
+    shape,
+    Polygon,
+    MultiPolygon,
+    GeometryCollection,
+    LineString,
+)  # type: ignore
+from shapely.ops import split, unary_union  # type: ignore
 import pyarrow.parquet as pq  # type: ignore
+from rasterra import RasterArray  # type: ignore
 
 parser = argparse.ArgumentParser(description="Run CLIMADA code")
 
@@ -29,6 +34,7 @@ parser.add_argument("--basin", type=str, required=True, help="Basin")
 parser.add_argument("--relative_risk", type=str, required=True, help="Relative risk type")
 parser.add_argument("--sample_name", type=str, required=True, help="Sample name for relative risk")
 parser.add_argument("--num_cores", type=int, required=True, help="Number of cores to use for parallel processing")
+parser.add_argument("--admin_level", type=int, required=False, default=0, choices=[0, 1], help="Admin level (0 or 1)")
 
 
 # Parse arguments
@@ -42,24 +48,36 @@ basin = args.basin
 relative_risk = args.relative_risk
 sample_name = args.sample_name
 num_cores = args.num_cores
+admin_level = args.admin_level
 
 
 # Constants
 PAF_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2/")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2/")
-# SAVE_ROOT = Path("/mnt/share/scratch/users/mfiking/outputs/stage3") # TEST
-
-GDF_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84_admin0.parquet")
-POP_TOTALS_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/fhs_population_2021_all_years.parquet")
+GRIDED_POP_PATH = Path("/mnt/team/rapidresponse/pub/population-model/results/2026_05_16/")
+POP_TOTALS_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/fhs_population_2023_all_years.parquet")
 ANTIMERIDIAN = LineString([(180, -90), (180, 90)])
-SHP_ROOT_NORMALIZED = Path('/snfs1/WORK/11_geospatial/admin_shapefiles/2024_07_29')
+
+_SHP_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile")
+
+if admin_level == 0:
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2/")
+    GDF_PATH = _SHP_ROOT / "global_WGS84_admin0.parquet"
+    SHP_ROOT_NORMALIZED = _SHP_ROOT / "global_WGS84_admin0_normalized.parquet"
+elif admin_level == 1:
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2_admin1/")
+    GDF_PATH = _SHP_ROOT / "global_WGS84_admin1_0_360.parquet"
+    # admin1 is already FHS-filtered so no special-region merging is needed.
+    # For NA basin the 0-360 file is normalized to -180..180 at load time.
+    SHP_ROOT_NORMALIZED = _SHP_ROOT / "global_WGS84_admin1_0_360.parquet"
+else:
+    raise ValueError(f"admin_level must be 0 or 1, got {admin_level!r}")
 
 ##############################
 #     Helper Functions       #
 ##############################
 def normalize_geom_to_0_360(geom):
     """Shift WGS84 geometry from -180–180 to 0–360 for clipping against 0–360 raster."""
-    def shift_x(x, y, z=None):
+    def shift_x(x, y, _z=None):
         return x + 360 if x < 0 else x, y
     return shapely.ops.transform(shift_x, geom)
 
@@ -75,13 +93,6 @@ def normalize_longitudes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf = gdf.copy()
     gdf["geometry"] = gdf["geometry"].apply(shift_geom)
     return gdf
-
-def normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
-    ds = ds.assign_coords(
-        lon=(((ds.lon + 180) % 360) - 180)
-    ).sortby("lon")
-
-    return ds
 
 def subset_affected_area(
     rr_raster: rt.RasterArray,
@@ -115,7 +126,7 @@ def subset_affected_area(
     rows, cols = np.where(mask)
 
     transform = rr_raster.transform
-    a, b, c, d, e, f = transform[:6]
+    a, _b, c, _d, e, f = transform[:6]
 
     # Pixel → coordinate conversion
     xmin = c + cols.min() * a
@@ -130,59 +141,22 @@ def subset_affected_area(
     # Clip raster to affected area
     return rr_raster.clip(gdf)
 
-def reproject_raster_to_equal_area(raw_paf_raster):
-    raw_paf_raster = raw_paf_raster.to_crs("ESRI:54034")
-    raw_paf_raster = subset_affected_area(raw_paf_raster)
-
-    return raw_paf_raster
-
-def reproject_shapefile_to_equal_area(raw_paf_raster, intersected_shapes, basin):
+def reproject_shapefile_to_equal_area(intersected_shapes):
     # --- Normalize longitudes if crossing antimeridian ---
     maxx = intersected_shapes.geometry.bounds.maxx.max()
     if maxx > 180:
         intersected_shapes = normalize_longitudes(intersected_shapes)
 
-    # --- Attempt to reproject raster first ---
-    raster_reprojected = False
-    try:
-        raw_paf_raster_cea = reproject_raster_to_equal_area(raw_paf_raster)
-        raster_reprojected = True
-    except Exception as e:
-        print(f"[WARNING] Raster reprojection failed ({e}) → will skip raster-based clipping")
+    # Reproject shapes to equal-area CRS (cheap, vector-only).
+    intersected_shapes = intersected_shapes.to_crs("ESRI:54034")
 
-    # --- Reproject shapes to raster CRS or ESRI:54034 if raster failed ---
-    if raster_reprojected:
-        intersected_shapes = intersected_shapes.to_crs(raw_paf_raster_cea.crs)
-
-        # --- Safe clipping & polygonizing using raster bounds ---
-        try:
-            xmin, xmax, ymin, ymax = raw_paf_raster_cea.bounds
-            raster_bbox = box(xmin, ymin, xmax, ymax)
-            bbox_gdf = gpd.GeoDataFrame(geometry=[raster_bbox], crs=raw_paf_raster_cea.crs)
-            clipped = intersected_shapes.clip(bbox_gdf)
-            if clipped.empty:
-                print("[INFO] Clipping would empty intersected_shapes → skipping clip")
-            else:
-                intersected_shapes = clipped
-                intersected_shapes["geometry"] = intersected_shapes.geometry.apply(_polygonize)
-        except Exception as e:
-            print(f"[WARNING] Clipping failed ({e}) → skipping clip")
-    else:
-        # Raster failed, just reproject shapes directly to equal area CRS
-        intersected_shapes = intersected_shapes.to_crs("ESRI:54034")
-        intersected_shapes["geometry"] = intersected_shapes.geometry.apply(_polygonize)
-
+    intersected_shapes["geometry"] = intersected_shapes.geometry.apply(_polygonize)
     return intersected_shapes
+
+
 ##############################
 #     Load Raw PAF Raster    #
 ##############################
-def chmod_recursive(path: Path, mode: int = 0o775):
-    for root, dirs, files in os.walk(path):
-        for d in dirs:
-            os.chmod(os.path.join(root, d), mode)
-        for f in files:
-            os.chmod(os.path.join(root, f), mode)
-
 def load_raw_paf_raster(
     storm_draw: str,
     source_id: str,
@@ -237,16 +211,12 @@ def load_shapefiles():
 def load_shapefiles_normalized(
     shapefile_root: Path = SHP_ROOT_NORMALIZED,
 ) -> gpd.GeoDataFrame:
-    """
-    Load land polygons intersecting storm bounding box (-180 to 180 longitude space).
-    """
-    admin_level = 0
-    simplified_suffix = ''
-
-    # --- Load shapefile ---
-    shp_path = shapefile_root / f"lbd_standard_admin_{admin_level}{simplified_suffix}.shp"
-    gdf = gpd.read_file(shp_path)
-
+    """Load NA-basin admin shapes. For admin0 this is a pre-normalized parquet
+    (-180..180, special regions merged). For admin1 the 0-360 parquet is used
+    and lon-normalized here so it matches the NA PAF raster convention."""
+    gdf = gpd.read_parquet(shapefile_root)
+    if admin_level == 1:
+        gdf = normalize_longitudes(gdf)
     return gdf
 ##########################################
 #           Load Population              #
@@ -281,7 +251,7 @@ def get_population_total(pop_df: pd.DataFrame, year: int, admin_id: int):
 
 
 def load_in_gridded_population(year: int | str, meters: int | str, bounds: tuple | None = None):
-    pop_path = Path("/mnt/team/rapidresponse/pub/population-model/results/current/")
+    pop_path = GRIDED_POP_PATH
     
     if bounds is None:
         pop_raster = rt.load_raster(pop_path / f"world_cylindrical_{meters}" / f"{year}q1.tif")
@@ -460,6 +430,15 @@ def save_batch_paf_dataframe(
     paf_df.to_parquet(save_path, index=False)
     print(f"Saved batch-year PAF dataframe: {save_path}")
 
+    # Set permissions on the file we just wrote and its parent so the group
+    # can read + traverse. Wrapped because a chmod failure shouldn't
+    # invalidate a successful parquet write.
+    try:
+        os.chmod(save_path, 0o775)
+        os.chmod(save_path.parent, 0o775)
+    except Exception as e:
+        print(f"⚠️ Could not set permissions for {save_path}: {e}")
+
 
 def check_if_year_complete(
     storm_draw: str,
@@ -565,7 +544,6 @@ def split_antimeridian_geom(geom_cea):
 ##########################################
 #            MAIN FUNCTION               #
 ##########################################
-# import time
 def process_single_year(args):
     (
         storm_draw,
@@ -627,128 +605,131 @@ def process_single_year(args):
     if len(intersected_shapes) == 0:
         print(f"No intersected shapes for year {year}, basin {basin}. Skipping.")
         del raw_paf_raster, pop_df, shapefile
-        gc.collect()
         return
 
     # Reproject once
-    intersected_shapes = reproject_shapefile_to_equal_area(raw_paf_raster, intersected_shapes, basin)
+    intersected_shapes = reproject_shapefile_to_equal_area(intersected_shapes)
 
     print(f"Processing year {year} with {len(intersected_shapes)} intersected shapes")
 
-    for _, admin_shape in intersected_shapes.iterrows():
+    for admin_shape in intersected_shapes.itertuples(index=False):
 
-        admin_geom = admin_shape.geometry
-        admin_id = admin_shape["loc_id"]
+        admin_id = getattr(admin_shape, "loc_id", None)
+        try:
+            admin_geom = admin_shape.geometry
 
-        # split if crossing antimeridian
-        geom_pieces_cea, geom_pieces_wgs84 = split_antimeridian_geom(admin_geom)
-        if not geom_pieces_cea:
-            geom_pieces_cea = [admin_geom]
-            geom_pieces_wgs84 = [gpd.GeoSeries([admin_geom], crs="ESRI:54034").to_crs("EPSG:4326").iloc[0]]
+            # split if crossing antimeridian
+            geom_pieces_cea, geom_pieces_wgs84 = split_antimeridian_geom(admin_geom)
+            if not geom_pieces_cea:
+                geom_pieces_cea = [admin_geom]
+                geom_pieces_wgs84 = [gpd.GeoSeries([admin_geom], crs="ESRI:54034").to_crs("EPSG:4326").iloc[0]]
 
-        print(f"Split into {len(geom_pieces_cea)} pieces after antimeridian check")
+            print(f"Split into {len(geom_pieces_cea)} pieces after antimeridian check")
 
-        numerator_total = 0.0
-        population_exposed_total = 0.0
+            numerator_total = 0.0
+            population_exposed_total = 0.0
 
-        for piece_cea, piece_wgs84 in zip(geom_pieces_cea, geom_pieces_wgs84):
-            # use precomputed WGS84 piece
-            if basin != "NA":                 
-                piece_wgs84 = normalize_geom_to_0_360(piece_wgs84)
+            for piece_cea, piece_wgs84 in zip(geom_pieces_cea, geom_pieces_wgs84):
+                # use precomputed WGS84 piece
+                if basin != "NA":
+                    piece_wgs84 = normalize_geom_to_0_360(piece_wgs84)
 
-            paf_piece = raw_paf_raster.clip(piece_wgs84).mask(piece_wgs84, all_touched=True)
-            paf_piece = subset_affected_area(paf_piece)
+                paf_piece = raw_paf_raster.clip(piece_wgs84).mask(piece_wgs84, all_touched=True)
+                paf_piece = subset_affected_area(paf_piece)
 
-            # take the intersection of piece_wgs84 with the raster bounds
-            minx, maxx, miny, maxy = paf_piece.bounds
-            buffer = 0.2
-            minx -= buffer
-            maxx += buffer
-            miny -= buffer
-            maxy += buffer
-            raster_bounds = box(minx, miny, maxx, maxy)
+                # take the intersection of piece_wgs84 with the raster bounds
+                minx, maxx, miny, maxy = paf_piece.bounds
+                buffer = 0.2
+                minx -= buffer
+                maxx += buffer
+                miny -= buffer
+                maxy += buffer
+                raster_bounds = box(minx, miny, maxx, maxy)
 
+                # Intersect and clip
+                intersection = piece_wgs84.intersection(raster_bounds)
+                intersection_gdf = gpd.GeoDataFrame(geometry=[intersection], crs="EPSG:4326")
+                intersection_cea = intersection_gdf.to_crs("ESRI:54034").iloc[0].geometry
+                intersection_cea_bounds = intersection_cea.bounds
 
-            # Intersect and clip
-            intersection = piece_wgs84.intersection(raster_bounds)
-            intersection_gdf = gpd.GeoDataFrame(geometry=[intersection], crs="EPSG:4326")
-            intersection_cea = intersection_gdf.to_crs("ESRI:54034").iloc[0].geometry
-            intersection_cea_bounds = intersection_cea.bounds
-            
+                # ----------------------------
+                # Load population (bounded)
+                # ----------------------------
+                pop_piece = load_in_gridded_population(year, 100, bounds=intersection_cea_bounds)
+
+                try:
+                    pop_piece_masked = pop_piece.mask(piece_cea, all_touched=True)
+                    del pop_piece
+                except WindowError:
+                    print("[INFO] Admin piece does not intersect raster → skipping piece")
+                    continue
+
+                # Extract arrays
+                pop_arr = pop_piece_masked._ndarray.astype(np.float32, copy=False)
+
+                # --- resample PAF to masked grid ---
+                paf_arr = (
+                    paf_piece
+                    .resample_to(pop_piece_masked, resampling="nearest")
+                    ._ndarray.astype(np.float32, copy=False)
+                )
+
+                del paf_piece, pop_piece_masked
+
+                # ----------------------------
+                # Valid cells
+                # ----------------------------
+                valid_mask = (pop_arr > 0) & np.isfinite(pop_arr) & (paf_arr > 0) & np.isfinite(paf_arr)
+
+                if valid_mask.any():
+                    numerator_total += (pop_arr[valid_mask] * paf_arr[valid_mask]).sum()
+                    population_exposed_total += pop_arr[valid_mask].sum()
+
+                # clean arrays
+                del pop_arr, paf_arr, valid_mask
+
             # ----------------------------
-            # Load population (bounded)
+            # Population denominator
             # ----------------------------
-            pop_piece = load_in_gridded_population(year, 100, bounds=intersection_cea_bounds)
-
-            try:
-                pop_piece_masked = pop_piece.mask(piece_cea, all_touched=True)
-                del pop_piece
-            except rasterio.errors.WindowError:
-                print("[INFO] Admin piece does not intersect raster → skipping piece")
-                continue
-
-            # Extract arrays
-            pop_arr = pop_piece_masked._ndarray.astype(np.float32, copy=False)
-
-            # --- resample PAF to masked grid ---
-            paf_arr = (
-                paf_piece
-                .resample_to(pop_piece_masked, resampling="nearest")
-                ._ndarray.astype(np.float32, copy=False)
+            pop_sum, special_region_flag = get_population_total(
+                pop_df=pop_df,
+                year=year,
+                admin_id=admin_id,
             )
 
-            del paf_piece, pop_piece_masked
-            gc.collect()
+            if pop_sum == 0:
+                weighted_paf = 0.0
+                population_exposed = 0.0
+            else:
+                weighted_paf = numerator_total / pop_sum
+                population_exposed = population_exposed_total
 
-            # ----------------------------
-            # Valid cells
-            # ----------------------------
-            valid_mask = (pop_arr > 0) & np.isfinite(pop_arr) & (paf_arr > 0) & np.isfinite(paf_arr)
+            paf_records.append({
+                "storm_draw": storm_draw,
+                "location_id": admin_id,
+                "year": year,
+                "total_population": float(pop_sum),
+                "population_exposed": float(population_exposed),
+                "population_weighted_paf": float(weighted_paf),
+                "relative_risk": relative_risk,
+                "special_region_flag": special_region_flag,
+            })
 
-            if valid_mask.any():
-                numerator_total += (pop_arr[valid_mask] * paf_arr[valid_mask]).sum()
-                population_exposed_total += pop_arr[valid_mask].sum()
-
-            # clean arrays
-            del pop_arr, paf_arr, valid_mask
-            gc.collect()
-
-        # ----------------------------
-        # Population denominator
-        # ----------------------------
-        pop_sum, special_region_flag = get_population_total(
-            pop_df=pop_df,
-            year=year,
-            admin_id=admin_id,
-        )
-
-        if pop_sum == 0:
-            weighted_paf = 0.0
-            population_exposed = 0.0
-        else:
-            weighted_paf = numerator_total / pop_sum
-            population_exposed = population_exposed_total
-
-        paf_records.append({
-            "storm_draw": storm_draw,
-            "location_id": admin_id,
-            "year": year,
-            "total_population": float(pop_sum),
-            "population_exposed": float(population_exposed),
-            "population_weighted_paf": float(weighted_paf),
-            "relative_risk": relative_risk,
-            "special_region_flag": special_region_flag,
-        })
-
-        # explicitly clean per admin
-        del numerator_total, population_exposed_total, geom_pieces_cea, geom_pieces_wgs84, admin_geom
-        gc.collect()
+            # explicitly clean per admin
+            del numerator_total, population_exposed_total, geom_pieces_cea, geom_pieces_wgs84, admin_geom
+        except Exception as e:
+            print(
+                f"❌ Admin {admin_id} failed in year {year} "
+                f"({storm_draw}/{source_id}/{variant_label}/{experiment_id}/"
+                f"{batch_year}/{basin}): {type(e).__name__}: {e}"
+            )
+            traceback.print_exc()
+            continue
 
     # ----------------------------
     # Final cleanup
     # ----------------------------
     del raw_paf_raster, intersected_shapes, shapefile, pop_df
-    gc.collect()
 
     final_paf_df = (
         pd.DataFrame.from_records(paf_records)
@@ -770,7 +751,6 @@ def process_single_year(args):
     )
 
     del paf_records, final_paf_df
-    gc.collect()
 
 def main(
     storm_draw: str,
@@ -811,26 +791,6 @@ def main(
         progress_bar=True,
     )
     print(f"parallel tasks done")
-
-
-
-    # apply permissions for all processed years
-    for year in years:
-        save_dir = (
-            save_root
-            / storm_draw
-            / source_id
-            / variant_label
-            / experiment_id
-            / batch_year
-            / basin
-            / str(year)
-            / "paf_df"
-        )
-
-        if save_dir.exists():
-            chmod_recursive(save_dir, mode=0o775)
-
 
 
 main(

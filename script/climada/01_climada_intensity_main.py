@@ -1,28 +1,27 @@
-from math import log
+"""
+Stage 1: CLIMADA tropical cyclone intensity, exposure, and per-location landfall.
+"""
+
 from pathlib import Path
-from tracemalloc import start
 import xarray as xr  # type: ignore
 import numpy as np  # type: ignore
 from climada.hazard import TCTracks, TropCyclone, Centroids
 import gc
 import re
+import json
 import pandas as pd  # type: ignore
 import geopandas as gpd  # type: ignore
 import os
-import rasterio  # type: ignore 
-from rasterio import features  # type: ignore
-from shapely.geometry import Point, box, mapping  # type: ignore
 import zarr  # type: ignore
 import argparse
-from datetime import datetime, timedelta
+import traceback
+from datetime import datetime, timezone
 import shutil
 from rra_tools.parallel import run_parallel  # type: ignore
-from scipy.ndimage import binary_dilation  # type: ignore
 import rasterra as rt  # type: ignore
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import box  # type: ignore
 from affine import Affine  # type: ignore
 from rasterio.errors import WindowError
-
 
 import logging
 
@@ -54,9 +53,9 @@ num_cores = args.num_cores
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
 SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2/")
 LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2_log/")
-COUNTRY_LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2_storm_country_log/")
 RESOLUTION = 0.1  # degrees
 GDF_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84.parquet")
+SHP_ROOT_NORMALIZED = Path('/snfs1/WORK/11_geospatial/admin_shapefiles/2024_07_29')
 
 ######################################
 #        Read in Tracks              #
@@ -92,8 +91,8 @@ def read_custom_tracks_nc(
 
 def read_single_storm_from_dataset(ds_all, storm_index: int) -> xr.Dataset:
     """
-    Slice a single storm from an open dataset, returning only valid (non-NaN) time steps.
-    Optimized to minimize memory and computation for long tracks.
+    Slice a single storm from an open dataset, returning only valid (non-NaN)
+    time steps trimmed to the first/last step where ANY core variable is finite.
     """
     if storm_index >= ds_all.sizes["n_trk"]:
         raise IndexError(f"Storm index {storm_index} out of range")
@@ -107,21 +106,17 @@ def read_single_storm_from_dataset(ds_all, storm_index: int) -> xr.Dataset:
         ] if v in ds_track
     ]
 
-    # Start from first and last non-NaN across any variable
-    t0, t1 = None, None
-    for t in range(ds_track.sizes["time"]):
-        if any(not np.isnan(ds_track[var].values[t]) for var in core_vars):
-            t0 = t
-            break
-
-    for t in reversed(range(ds_track.sizes["time"])):
-        if any(not np.isnan(ds_track[var].values[t]) for var in core_vars):
-            t1 = t + 1  # slice end exclusive
-            break
-
-    if t0 is None or t1 is None or t1 <= t0:
+    # Per-timestep mask: True if ANY core variable is finite at that step.
+    any_finite = np.any(
+        np.stack([~np.isnan(ds_track[v].values) for v in core_vars], axis=0),
+        axis=0,
+    )
+    valid_idx = np.flatnonzero(any_finite)
+    if valid_idx.size == 0:
         raise ValueError(f"Storm {storm_index} contains no valid data")
 
+    t0 = int(valid_idx[0])
+    t1 = int(valid_idx[-1]) + 1  # slice end exclusive
     return ds_track.isel(time=slice(t0, t1)).load()
 
 
@@ -134,24 +129,27 @@ def normalize_nc_storm_for_climada(ds_track: xr.Dataset) -> xr.Dataset:
     Keeps arrays square (padded time steps included), but computes
     start_date and end_date using only valid (non-NaN) core variable time steps.
     """
-    # --- Build time coordinate ---
+    # --- Build time coordinate (vectorized) ---
     start_year = int(ds_track["tc_years"].values)
     start_month = int(ds_track["tc_month"].values)
-    start_dt = datetime(start_year, start_month, 1)
+    start_dt = pd.Timestamp(year=start_year, month=start_month, day=1)
 
-    # Convert time (seconds) to datetime
     time_seconds = ds_track["time"].values
-    time_dt = np.array([start_dt + timedelta(seconds=float(t)) for t in time_seconds])
+    time_dt = pd.to_datetime(time_seconds, unit="s", origin=start_dt).to_numpy()
     n_time = time_dt.size
 
-    # --- Identify valid time steps ---
+    # --- Identify fully-valid time steps (all core vars finite) and use those
+    # to derive start/end date. The track may have leading/trailing steps where
+    # only SOME core vars are finite (those survived the upstream any-finite
+    # trim in read_single_storm_from_dataset). ---
     core_vars = ["lon", "lat", "max_sustained_wind", "central_pressure", "environmental_pressure"]
-    valid_mask = np.all([~np.isnan(ds_track[var].values) for var in core_vars], axis=0)
-
-    # Compute start and end date based only on valid steps
+    valid_mask = np.all(
+        np.stack([~np.isnan(ds_track[v].values) for v in core_vars], axis=0),
+        axis=0,
+    )
     time_dt_valid = time_dt[valid_mask]
-    start_date_iso = time_dt_valid[0].date().isoformat()
-    end_date_iso = time_dt_valid[-1].date().isoformat()
+    start_date_iso = str(time_dt_valid[0].astype("datetime64[D]"))
+    end_date_iso = str(time_dt_valid[-1].astype("datetime64[D]"))
 
     # --- Core variables ---
     lon = ds_track["lon"].values
@@ -215,11 +213,6 @@ def prepare_track_for_climada(ds_track: xr.Dataset):
 #              Helper Functions            #
 ############################################
     
-def normalize_lon(lon: float) -> float:
-    """Normalize longitude to [-180, 180] range."""
-    lon = ((lon + 180) % 360) - 180
-    return lon
-
 def chmod_recursive(path: Path, mode: int = 0o775):
     for root, dirs, files in os.walk(path):
         for d in dirs:
@@ -228,15 +221,26 @@ def chmod_recursive(path: Path, mode: int = 0o775):
             os.chmod(os.path.join(root, f), mode)
 
 def ensure_min_grid(da: xr.DataArray, buffer_deg: float = 0.1) -> xr.DataArray:
+    """
+    Pad a single-pixel lat or lon dimension with NaN neighbors so downstream
+    rasterization always sees at least a 3-cell axis.
+    """
     if da.lat.size == 1:
         c = float(da.lat.values[0])
-        da = da.reindex(lat=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
+        da = da.reindex(lat=[c-buffer_deg, c, c+buffer_deg], fill_value=np.nan)
 
     if da.lon.size == 1:
         c = float(da.lon.values[0])
-        da = da.reindex(lon=[c-buffer_deg, c, c+buffer_deg], fill_value=0)
+        da = da.reindex(lon=[c-buffer_deg, c, c+buffer_deg], fill_value=np.nan)
 
     return da
+
+
+def normalize_lon_to_180(da: xr.DataArray) -> xr.DataArray:
+    """Shift longitude coords from 0-360 to -180..180 and sort ascending."""
+    return da.assign_coords(
+        lon=(((da.lon + 180) % 360) - 180)
+    ).sortby("lon")
 
 #####################################
 #    Basin Centroid Functions        #
@@ -337,7 +341,6 @@ def generate_speed_per_storm(
     haz: TropCyclone,
     centroids: Centroids,
     tc_tracks: TCTracks,
-    buffer_deg: float = 5.0,
 ) -> xr.DataArray:
     """
     Generate per-storm wind speed DataArray, cropped to storm footprint,
@@ -365,9 +368,11 @@ def generate_speed_per_storm(
     # --- Reshape windfield ---
     try:
         wf_reshaped = wf.reshape(n_time, n_lat, n_lon, 2)
-    except ValueError:
-        print(f"⚠️ Skipping storm {storm_name}: shape mismatch")
-        return xr.DataArray()  # return empty DA
+    except ValueError as e:
+        raise ValueError(
+            f"Windfield shape mismatch for storm {storm_name}: "
+            f"got {wf.shape}, expected ({n_time}, {n_lat}, {n_lon}, 2)"
+        ) from e
 
     # --- Create DataArray ---
     da = xr.DataArray(
@@ -511,6 +516,11 @@ def compute_yearly_exposure_per_storm(
 #    Per Storm Intensity Functions   #
 ######################################
 
+
+class NoIntensityError(Exception):
+    """Raised when CLIMADA produces zero intensity at every centroid for a storm."""
+
+
 def generate_intensity_per_storm(
     haz: TropCyclone,
     centroids: Centroids,
@@ -539,18 +549,17 @@ def generate_intensity_per_storm(
     event = tc_tracks.data[0]
 
     storm_name = event.name
-    storm_basin = event.basin
+    # Read the scalar storm-level attr (set in normalize_nc_storm_for_climada),
+    # NOT the per-timestep `basin` data variable, which would give an array.
+    storm_basin = getattr(event, "storm_basin", None)
     storm_category = event.category
     storm_id = event.sid
     start_date = event.start_date
     end_date = event.end_date
 
 
-    try:
-        # shape: (n_centroids,)
-        intensity_flat = haz.intensity.toarray()[0, :]
-    except Exception as e:
-        print(f"⚠️ Could not read intensity for {storm_name}: {e}")
+    # shape: (n_centroids,)
+    intensity_flat = haz.intensity.toarray()[0, :]
 
     if intensity_flat.size != n_lat * n_lon:
         print(
@@ -583,19 +592,11 @@ def generate_intensity_per_storm(
             "during the storm lifetime")
         })
 
-    data_max = float(da.max().values)
-
-    if data_max == 0:
-        # Return full zero array with same coords and attributes
-        empty_da = xr.DataArray(
-            np.zeros((n_lat, n_lon), dtype=float),
-            coords={"lat": lat_desc, "lon": lon},
-            dims=["lat", "lon"],
-            name=f"{storm_name}_intensity",
+    if float(da.max().values) == 0:
+        raise NoIntensityError(
+            f"Storm {storm_name} produced zero intensity at every centroid"
         )
-        empty_da.attrs.update(da.attrs)
-        return empty_da
-    
+
     # ---- Crop to storm footprint in 0–360 ----
     da = da.where(da > 0)
     da = da.dropna(dim="lat", how="all")
@@ -608,109 +609,26 @@ def generate_intensity_per_storm(
 
     return da
 
-######################################
-#       Track Storm Duration         #
-######################################
-def track_storm_duration(
-    storm_da: xr.DataArray,
-    source_id: str,
-    variant_label: str,
-    experiment_id: str,
-    batch_year: str,
-    basin: str,
-    draw: int,
-) -> pd.DataFrame:
-    """
-    Track storm duration in days for each storm.
-
-    Parameters
-    ----------
-    storm_intensity : xr.DataArray
-        DataArray of storm wind speed with dims ('time', 'lat', 'lon').
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns:
-        - storm_name
-        - storm_id
-        - start_date
-        - end_date
-        - duration_days
-    """
-
-
-    storm_name = storm_da.attrs.get("storm_name")
-    storm_id = storm_da.attrs.get("storm_id")
-    start_date = storm_da.attrs.get("start_date")
-    end_date = storm_da.attrs.get("end_date")
-
-    # calculate duration in days
-    start_dt = datetime.fromisoformat(str(start_date))
-    end_dt = datetime.fromisoformat(str(end_date))
-    duration_days = (end_dt - start_dt).days + 1  # inclusive
-
-    rows = []
-    # if duration is 30 days or more, log a warning
-    if duration_days >= 30:
-        rows.append({
-            "storm_name": storm_name,
-            "storm_id": storm_id,
-            "start_date": start_date,
-            "end_date": end_date,
-            "duration_days": duration_days,
-            "warning": "Duration exceeds 30 days - check for potential issues",
-        })
-
-    df_duration = pd.DataFrame(rows)
-
-    # save log
-    if not df_duration.empty:
-        log_path = LOG_DIR / f"storm_duration_{source_id}_{variant_label}_{experiment_id}_{batch_year}_{basin}_draw{draw}.csv"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        write_header = not log_path.exists()
-        df_duration.to_csv(
-            log_path,
-            mode="a",
-            header=write_header,
-            index=False,
-        )
-
-
 #############################
 #       Helper Functions    #
 #############################
 
 def get_storm_indices(ds_all: xr.Dataset) -> list[int]:
     """
-    Return a list of valid storm indices from an open multi-storm dataset
-    for CLIMADA processing. No particular order is enforced.
-
-    Parameters
-    ----------
-    ds_all : xr.Dataset
-        Multi-storm dataset containing 'n_trk' dimension.
-
-    Returns
-    -------
-    list[int]
-        List of valid storm indices.
+    Return a list of storm indices that have at least one timestep where ALL
+    core variables are non-NaN. Vectorized across n_trk for speed.
     """
-    n_storms = ds_all.sizes["n_trk"]
-    valid_indices = []
-
     core_vars = ["lon", "lat", "max_sustained_wind", "central_pressure", "environmental_pressure"]
 
-    for storm_index in range(n_storms):
-        ds_track = ds_all.isel(n_trk=storm_index)
-
-        # check if there are any valid timesteps across core variables
-        valid_mask = np.all([~np.isnan(ds_track[var].values) for var in core_vars], axis=0)
-        if valid_mask.any():
-            valid_indices.append(storm_index)
-
-    return valid_indices
+    # Per (n_trk, time) timestep: True iff every core var is finite.
+    # np.stack -> shape (len(core_vars), n_trk, time); reduce over var axis.
+    per_timestep_valid = np.all(
+        np.stack([~np.isnan(ds_all[v].values) for v in core_vars], axis=0),
+        axis=0,
+    )
+    # Per storm: True iff any timestep is valid.
+    has_any_valid = per_timestep_valid.any(axis=1)
+    return np.nonzero(has_any_valid)[0].tolist()
 
 
 def sanitize_attrs(attrs: dict) -> dict:
@@ -747,50 +665,79 @@ def sanitize_attrs(attrs: dict) -> dict:
 #     Check Landfall Functions          #
 #########################################
 
-def load_land_polygons_for_storm(
-    storm_da,
-    shapefile_gdf_path: str,
-    buffer: float = 2.0,
+def load_global_land_gdf(basin: str) -> gpd.GeoDataFrame:
+    """
+    Load the full basin-appropriate land-polygon GeoDataFrame once per draw.
+
+    - NA basin uses the normalized (-180..180) admin0 shapefile.
+    - All other basins use the 0-360 global WGS84 parquet.
+
+    Builds the spatial index eagerly so the first per-storm bbox query
+    doesn't pay for it.
+    """
+    if basin == "NA":
+        shp_path = SHP_ROOT_NORMALIZED / "lbd_standard_admin_0.shp"
+        gdf = gpd.read_file(shp_path)
+    else:
+        gdf = gpd.read_parquet(GDF_PATH)
+
+    _ = gdf.sindex  # force the spatial index to build
+    return gdf
+
+
+def subset_land_for_storm(
+    global_land_gdf: gpd.GeoDataFrame,
+    storm_da: xr.DataArray,
+    basin: str,
+    buffer: float = 0.25,
 ) -> gpd.GeoDataFrame:
     """
-    Load land polygons intersecting storm bounding box (0–360 longitude space).
-    """
+    Return land polygons intersecting the storm bbox, each clipped to the bbox.
+    Uses the pre-built spatial index on the global gdf for an O(log n) candidate
+    query, then a precise `intersects` predicate.
 
+    - NA basin: storm coords are -180..180, no wraparound.
+    - Other basins: storm coords are 0-360; bbox may straddle the 360 seam,
+      handled by splitting into two boxes and unioning.
+    """
     min_lon = float(storm_da["lon"].min()) - buffer
     max_lon = float(storm_da["lon"].max()) + buffer
     min_lat = float(storm_da["lat"].min()) - buffer
     max_lat = float(storm_da["lat"].max()) + buffer
 
-    gdf = gpd.read_parquet(shapefile_gdf_path)
-
-    # --------------------------------------------------
-    # Handle longitude wraparound (0–360 domain)
-    # --------------------------------------------------
-    if min_lon < 0 or max_lon > 360:
-        # wrapped bbox → split into two
-        boxes = []
-
-        if min_lon < 0:
-            boxes.append(box(0, min_lat, max_lon, max_lat))
-            boxes.append(box(360 + min_lon, min_lat, 360, max_lat))
-
-        elif max_lon > 360:
-            boxes.append(box(min_lon, min_lat, 360, max_lat))
-            boxes.append(box(0, min_lat, max_lon - 360, max_lat))
-
-        bbox_geom = gpd.GeoSeries(boxes, crs=gdf.crs).union_all()
-
+    if basin == "NA":
+        bbox_geom = box(min_lon, min_lat, max_lon, max_lat)
+    elif min_lon < 0:
+        bbox_geom = gpd.GeoSeries(
+            [
+                box(0, min_lat, max_lon, max_lat),
+                box(360 + min_lon, min_lat, 360, max_lat),
+            ],
+            crs=global_land_gdf.crs,
+        ).union_all()
+    elif max_lon > 360:
+        bbox_geom = gpd.GeoSeries(
+            [
+                box(min_lon, min_lat, 360, max_lat),
+                box(0, min_lat, max_lon - 360, max_lat),
+            ],
+            crs=global_land_gdf.crs,
+        ).union_all()
     else:
         bbox_geom = box(min_lon, min_lat, max_lon, max_lat)
 
-    gdf_subset = gdf[gdf.intersects(bbox_geom)].copy()
-    gdf_subset["geometry"] = gdf_subset.geometry.intersection(bbox_geom)
+    candidate_idx = global_land_gdf.sindex.query(bbox_geom, predicate="intersects")
+    if len(candidate_idx) == 0:
+        return global_land_gdf.iloc[0:0].copy()
 
-    return gdf_subset
+    subset = global_land_gdf.iloc[candidate_idx].copy()
+    subset["geometry"] = subset.geometry.intersection(bbox_geom)
+    subset = subset[~subset.geometry.is_empty].copy()
+    return subset
 
 def check_storm_landfall(
     storm_da: xr.DataArray,
-    land_gdf: "gpd.GeoDataFrame",
+    land_geom,
     wind_threshold: float = 17.0,
 ) -> bool:
     """
@@ -799,20 +746,20 @@ def check_storm_landfall(
     Returns True only if storm has winds > wind_threshold
     AND those winds intersect land.
 
+    `land_geom` is a pre-unioned land polygon (shapely Polygon or MultiPolygon),
+    computed once per storm and reused across landfall + clip calls.
+
     Uses RasterArray.clip().mask() to handle small islands robustly.
     """
 
-    # --- 0. Skip globally weak storms ---
     if float(storm_da.max().values) < wind_threshold:
         return False
 
-    # --- 1. Ensure minimal grid (single-pixel storms) ---
     storm_da = ensure_min_grid(storm_da)
 
     if storm_da.lat.size < 2 or storm_da.lon.size < 2:
         return False
 
-    # --- 2. Convert to RasterArray ---
     raster = to_raster(
         ds=storm_da,
         no_data_value=np.nan,
@@ -822,40 +769,29 @@ def check_storm_landfall(
     )
 
     xmin, xmax, ymin, ymax = raster.bounds
-
     raster_bbox = box(xmin, ymin, xmax, ymax)
 
-    # --- 3. Clip and mask to land ---
-    geom = land_gdf.geometry.union_all()  # Polygon or MultiPolygon
-
-    # --- KEY FIX ---
-    if not raster_bbox.intersects(geom):
+    if not raster_bbox.intersects(land_geom):
         return False  # storm is fully over ocean
 
-    # 1. Clip first
     try:
-        raster_clipped = raster.clip(geom)
+        raster_clipped = raster.clip(land_geom)
     except WindowError:
         return False  # no overlap in pixel space
 
-    # 2. Check if any valid pixels
     if raster_clipped._ndarray.size == 0:
         return False
 
-    # 3. Mask only if needed
     try:
-        raster_land = raster_clipped.mask(geom, all_touched=True)
+        raster_land = raster_clipped.mask(land_geom, all_touched=True)
     except WindowError:
         return False
 
     if raster_land._ndarray.size == 0:
         return False
 
-
-    # --- 4. Apply wind threshold ---
     data = raster_land._ndarray
     strong_wind_mask = np.isfinite(data) & (data > wind_threshold)
-    # --- 5. Check if any pixel survives ---
     return np.any(strong_wind_mask)
 
 def to_raster(
@@ -902,19 +838,13 @@ def to_raster(
 
 def clip_raster_to_land(
     da: xr.DataArray,
-    land_gdf: "gpd.GeoDataFrame",
+    land_geom,
 ) -> xr.DataArray:
+    """`land_geom` is a pre-unioned land polygon (shapely)."""
 
-    # --- 0️⃣ Ensure minimum grid (only if degenerate) ---
     if da.sizes.get("lat", 0) < 2 or da.sizes.get("lon", 0) < 2:
         da = ensure_min_grid(da, buffer_deg=0.1)
-        # ensure padding is NaN, not 0
-        da = da.where(da != 0, np.nan)
 
-    # 1️⃣ Union land polygons
-    geom = land_gdf.geometry.union_all()
-
-    # 2️⃣ Convert to RasterArray
     raster = to_raster(
         ds=da,
         no_data_value=np.nan,
@@ -923,11 +853,9 @@ def clip_raster_to_land(
         crs="EPSG:4326",
     )
 
-    # 3️⃣ Clip + mask (guard against empty intersection)
     try:
-        raster_land = raster.clip(geom).mask(geom, all_touched=True)
+        raster_land = raster.clip(land_geom).mask(land_geom, all_touched=True)
     except Exception:
-        # return empty raster with same structure
         return da * np.nan
 
     # 4️⃣ Build coordinates from transform
@@ -951,151 +879,164 @@ def clip_raster_to_land(
     return da_land
 
 
-def get_loc_ids_from_land_da_rra(
-    land_da: xr.DataArray,
-    loc_gdf: "gpd.GeoDataFrame",
-) -> list:
+#######################################
+#    Save Per Storm Functions         #
+#######################################
 
-    # --- 0️⃣ Skip empty ---
-    if not np.isfinite(land_da.data).any():
+def save_single_storm_metric(
+    da: xr.DataArray,
+    metric: str,
+    storm_index: int,
+    source_id: str,
+    variant_label: str,
+    experiment_id: str,
+    batch_year: str,
+    basin: str,
+    draw: int,
+    save_root: Path = SAVE_ROOT,
+):
+    """
+    Save a single storm's DataArray for a given metric (e.g. "intensity",
+    "exposure_hours") to a draw-level Zarr store, one group per storm.
+    """
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    draw_text = "" if draw == 0 else f"_e{draw - 1}"
+    start_year, end_year = batch_year.split("-")
+
+    draw_store = (
+        save_root
+        / source_id
+        / variant_label
+        / experiment_id
+        / batch_year
+        / basin
+        / metric
+        / f"{metric}_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}.zarr"
+    )
+
+    draw_store.parent.mkdir(parents=True, exist_ok=True)
+
+    storm_key = f"storm_{storm_index:04d}"
+
+    if draw_store.exists():
+        z = zarr.open(draw_store, mode="a")
+        if storm_key in z:
+            print(f"♻️ Overwriting existing storm {storm_index} in {draw_store}")
+            del z[storm_key]
+
+    da = da.copy()
+    da.name = metric
+    if da.dtype != "float32":
+        da = da.astype("float32")
+
+    da = da.chunk({"lat": 64, "lon": 64})
+    ds = da.to_dataset()
+    ds.attrs.update(sanitize_attrs(da.attrs))
+
+    encoding = {
+        metric: {
+            "compressors": [
+                {
+                    "name": "blosc",
+                    "configuration": {
+                        "cname": "zstd",
+                        "clevel": 9,
+                        "shuffle": "bitshuffle",
+                    },
+                }
+            ],
+            "dtype": "float32",
+            "fill_value": np.nan,
+        }
+    }
+
+    ds.to_zarr(
+        draw_store,
+        group=storm_key,
+        mode="a",
+        encoding=encoding,
+        zarr_format=3,
+        consolidated=False,
+    )
+
+
+def _landfall_parquet_path(
+    source_id: str,
+    variant_label: str,
+    experiment_id: str,
+    batch_year: str,
+    basin: str,
+    draw: int,
+    storm_index: int,
+    save_root: Path = SAVE_ROOT,
+) -> Path:
+    """Path to a single storm's landfall_locations parquet. Mirrors the
+    intensity zarr's draw-level directory naming so the layouts align."""
+    draw_text = "" if draw == 0 else f"_e{draw - 1}"
+    start_year, end_year = batch_year.split("-")
+    return (
+        save_root
+        / "metadata"
+        / source_id
+        / variant_label
+        / experiment_id
+        / batch_year
+        / basin
+        / "landfall_locations"
+        / f"landfall_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}"
+        / f"storm_{storm_index:04d}.parquet"
+    )
+
+
+def compute_storm_landfall_locations(
+    storm_intensity: xr.DataArray,
+    land_gdf: gpd.GeoDataFrame,
+    wind_threshold: float = 17.0,
+) -> list[dict]:
+    """
+    For each polygon in `land_gdf`, compute the max wind speed within that
+    polygon and return one record per polygon whose max meets the threshold.
+    """
+    if land_gdf.empty:
         return []
 
-    # --- 1️⃣ Handle true single-pixel storm ---
-    if (
-        land_da.sizes.get("lat", 0) == 1 and
-        land_da.sizes.get("lon", 0) == 1
-    ):
-        return ["999"]
+    start_date = getattr(storm_intensity, "start_date", None)
 
-    # --- 2️⃣ Convert to RasterArray ---
     raster = to_raster(
-        ds=land_da,
+        ds=storm_intensity,
         no_data_value=np.nan,
         lat_col="lat",
         lon_col="lon",
         crs="EPSG:4326",
     )
 
-    # --- 3️⃣ Mask non-NaN pixels ---
-    if not np.isfinite(raster._ndarray).any():
-        return []
-
-    # --- 4️⃣ Intersection ---
-    hit_loc_ids = []
-    for loc_id, geom in zip(loc_gdf["loc_id"], loc_gdf.geometry):
+    records: list[dict] = []
+    for loc_id, adm0_name, geom in zip(
+        land_gdf["loc_id"], land_gdf["ADM0_NAME"], land_gdf.geometry,
+    ):
         try:
-            clipped = raster.clip(geom)
+            clipped = raster.clip(geom).mask(geom, all_touched=True)
         except Exception:
             continue
-
-        if np.isfinite(clipped._ndarray).any():
-            hit_loc_ids.append(loc_id)
-
-    return hit_loc_ids
-#######################################
-#    Save Per Storm Functions         #
-#######################################
-
-def save_single_storm_intensity(
-    da: xr.DataArray,
-    storm_index: int,
-    source_id: str,
-    variant_label: str,
-    experiment_id: str,
-    batch_year: str,
-    basin: str,
-    draw: int,
-    save_root: Path = SAVE_ROOT,
-):
-    """
-    Save a single storm's intensity DataArray to a draw-level Zarr store.
-
-    Parameters
-    ----------
-    da : xr.DataArray
-        Single storm intensity.
-    storm_index : int
-        Index of the storm (used for Zarr group key).
-    source_id, variant_label, experiment_id, batch_year, basin, draw : str/int
-        Metadata for path construction.
-    save_root : Path, optional
-        Root path for saving.
-    """
-    save_root.mkdir(parents=True, exist_ok=True)
-
-    draw_text = "" if draw == 0 else f"_e{draw - 1}"
-    start_year, end_year = batch_year.split("-")
-
-    draw_store = (
-        save_root
-        / source_id
-        / variant_label
-        / experiment_id
-        / batch_year
-        / basin
-        / "intensity"
-        / f"intensity_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}.zarr"
-    )
-
-    draw_store.parent.mkdir(parents=True, exist_ok=True)
-
-    # Use storm index for Zarr group key
-    storm_key = f"storm_{storm_index:04d}"  # 4 digits to match original 
-    
-    # --- check if Zarr store exists and if this storm is already written ---
-    if draw_store.exists():
-        z = zarr.open(draw_store, mode="a")
-        if storm_key in z:
-            print(f"⚠️ Storm {storm_index} already exists in {draw_store}, skipping.")
-            return
-        
-    # Defensive copy & cast
-    da = da.copy()
-    da.name = "intensity"
-    if isinstance(da.attrs.get("basin"), xr.DataArray):
-        da.attrs["basin"] = str(da.attrs["basin"].values[0])
-    if da.dtype != "float32":
-        da = da.astype("float32")
-
-    # Chunk the DataArray first with dimension names
-    da = da.chunk({"lat": 64, "lon": 64})
-    ds = da.to_dataset()
-    ds.attrs.update(sanitize_attrs(da.attrs))
+        data = clipped._ndarray
+        finite_mask = np.isfinite(data)
+        if not finite_mask.any():
+            continue
+        max_wind = float(data[finite_mask].max())
+        if max_wind < wind_threshold:
+            continue
+        records.append({
+            "start_date": start_date,
+            "loc_id": loc_id,
+            "ADM0_NAME": adm0_name,
+            "max_wind_m_s": max_wind,
+        })
+    return records
 
 
-    # Then use simpler encoding without chunks specification
-    encoding = {
-        "intensity": {
-            "compressors": [
-                {
-                    "name": "blosc",
-                    "configuration": {
-                        "cname": "zstd",
-                        "clevel": 9,
-                        "shuffle": "bitshuffle",
-                    },
-                }
-            ],
-            "dtype": "float32",
-            "fill_value": np.nan,
-            # Remove chunks from encoding since we chunked the DataArray above
-        }
-    }
-
-    # Always append to Zarr store; create if it doesn't exist
-    ds.to_zarr(
-        draw_store,
-        group=storm_key,
-        mode="a",
-        encoding=encoding,
-        zarr_format=3,
-        consolidated=False,
-    )
-    # chmod_recursive(draw_store, mode=0o775)
-
-
-def save_single_storm_exposure(
-    da: xr.DataArray,
+def save_storm_landfall_locations(
+    records: list[dict],
     source_id: str,
     variant_label: str,
     experiment_id: str,
@@ -1103,83 +1044,42 @@ def save_single_storm_exposure(
     basin: str,
     draw: int,
     storm_index: int,
+    start_date: str | None,
     save_root: Path = SAVE_ROOT,
-):
+) -> None:
     """
-    Save a single storm's exposure_hours DataArray to a Zarr store.
-
-    If the Zarr store doesn't exist, it will be created automatically.
+    Write a single storm's per-location landfall records to parquet. Always
+    writes a file (even if `records` is empty) so resume logic can use the
+    parquet as the completion sentinel:
+      - file absent      → storm not yet processed
+      - file empty       → processed, no landfall (no zarrs expected)
+      - file has rows    → processed with landfall (zarrs must exist too)
     """
-    save_root.mkdir(parents=True, exist_ok=True)
-
-    draw_text = "" if draw == 0 else f"_e{draw - 1}"
-    start_year, end_year = batch_year.split("-")
-
-    draw_store = (
-        save_root
-        / source_id
-        / variant_label
-        / experiment_id
-        / batch_year
-        / basin
-        / "exposure_hours"
-        / f"exposure_hours_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}.zarr"
+    out_path = _landfall_parquet_path(
+        source_id, variant_label, experiment_id, batch_year,
+        basin, draw, storm_index, save_root,
     )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    draw_store.parent.mkdir(parents=True, exist_ok=True)
-
-    storm_key = f"storm_{storm_index:04d}"  # 4 digits to match original 
-
-    # --- check if Zarr store exists and if this storm is already written ---
-    if draw_store.exists():
-        z = zarr.open(draw_store, mode="a")
-        if storm_key in z:
-            print(f"⚠️ Storm {storm_index} already exists in {draw_store}, skipping.")
-            return
-        
-    # Defensive copy
-    da = da.copy()
-    da.name = "exposure_hours"
-
-    # Ensure float32
-    if da.dtype != "float32":
-        da = da.astype("float32")
-
-    # Chunk the DataArray first with dimension names
-    da = da.chunk({"lat": 64, "lon": 64})
-    ds = da.to_dataset()
-    ds.attrs.update(sanitize_attrs(da.attrs))
-
-    # Then use simpler encoding without chunks specification
-    encoding = {
-        "exposure_hours": {
-            "compressors": [
-                {
-                    "name": "blosc",
-                    "configuration": {
-                        "cname": "zstd",
-                        "clevel": 9,
-                        "shuffle": "bitshuffle",
-                    },
-                }
-            ],
-            "dtype": "float32",
-            "fill_value": np.nan,
-            # Remove chunks from encoding since we chunked the DataArray above
+    rows = [
+        {
+            "source_id": source_id,
+            "variant_label": variant_label,
+            "experiment_id": experiment_id,
+            "batch_year": batch_year,
+            "basin": basin,
+            "draw": draw,
+            "storm_id": storm_index,
+            "start_date": start_date,
+            **r,
         }
-    }
-
-    # Always append to Zarr store; create if it doesn't exist
-    ds.to_zarr(
-        draw_store,
-        group=storm_key,
-        mode="a",
-        encoding=encoding,
-        zarr_format=3,
-        consolidated=False,
-    )
-    # chmod_recursive(draw_store, mode=0o775)
-
+        for r in records
+    ]
+    df = pd.DataFrame(rows, columns=[
+        "source_id", "variant_label", "experiment_id", "batch_year",
+        "basin", "draw", "storm_id", "start_date", "loc_id", "ADM0_NAME", "max_wind_m_s",
+    ])
+    df.to_parquet(out_path, index=False)
 
 
 
@@ -1204,7 +1104,7 @@ def check_and_cleanup_zarr_store(
     draw_text = "" if draw == 0 else f"_e{draw - 1}"
     start_year, end_year = batch_year.split("-")
 
-    metrics = ["intensity", "exposure_hours", "days_impact"]
+    metrics = ["intensity", "exposure_hours"]
 
     for metric in metrics:
         draw_store = (
@@ -1219,15 +1119,15 @@ def check_and_cleanup_zarr_store(
         )
 
         if not draw_store.exists():
-            return 
+            return
 
         # If any partial files exist in the top-level Zarr store, delete it completely
         if any(draw_store.glob("*.partial")):
             print(f"⚠️ Found .partial file in {draw_store}. Deleting the entire store for a clean rerun...")
             shutil.rmtree(draw_store, ignore_errors=True)
-            return 
+            return
 
-    return 
+    return
 
 
 def check_existing_storm_in_zarr(
@@ -1240,13 +1140,35 @@ def check_existing_storm_in_zarr(
     storm_index: int,
     save_root: Path = SAVE_ROOT,
 ) -> bool:
+    """
+    Decide whether a storm is fully processed and can be skipped on resume.
 
-    metrics = ["intensity", "exposure_hours", "days_impact"]
+    Sentinel: the landfall parquet.
+      - missing  → storm not yet processed
+      - empty    → processed, no landfall (zarrs are not expected)
+      - has rows → processed with landfall (zarrs must also exist + validate)
+    """
+    landfall_path = _landfall_parquet_path(
+        source_id, variant_label, experiment_id, batch_year,
+        basin, draw, storm_index, save_root,
+    )
+    if not landfall_path.exists():
+        return False
 
+    try:
+        landfall_df = pd.read_parquet(landfall_path)
+    except Exception as e:
+        print(f"⚠️ Could not read landfall parquet {landfall_path}: {e}; will reprocess.")
+        landfall_path.unlink(missing_ok=True)
+        return False
+
+    if landfall_df.empty:
+        return True  # no-landfall sentinel; no zarrs to validate
+
+    metrics = ["intensity", "exposure_hours"]
     expected_arrays = {
         "intensity": {"intensity", "lat", "lon"},
         "exposure_hours": {"exposure_hours", "lat", "lon"},
-        "days_impact": {"days_impact", "lon", "time"},
     }
 
     draw_text = "" if draw == 0 else f"_e{draw - 1}"
@@ -1254,7 +1176,6 @@ def check_existing_storm_in_zarr(
     storm_key = f"storm_{storm_index:04d}"
 
     for metric in metrics:
-
         draw_store = (
             save_root
             / source_id
@@ -1273,22 +1194,18 @@ def check_existing_storm_in_zarr(
         if not storm_path.exists():
             return False
 
-        # 🔥 delete partial storms
         if any(storm_path.rglob("*.partial")):
             shutil.rmtree(storm_path, ignore_errors=True)
             print(f"⚠️ Deleted corrupted {storm_key} in {metric}")
             return False
 
-        # 🔍 validate structure
         try:
             g = zarr.open_group(storm_path, mode="r")
             arrays = set(g.array_keys())
-
             if not expected_arrays[metric].issubset(arrays):
                 print(f"⚠️ Invalid structure for {storm_key} in {metric}")
                 shutil.rmtree(storm_path, ignore_errors=True)
                 return False
-
         except Exception as e:
             print(f"⚠️ Error reading {storm_key} in {metric}: {e}")
             shutil.rmtree(storm_path, ignore_errors=True)
@@ -1296,9 +1213,6 @@ def check_existing_storm_in_zarr(
 
     return True
 
-
-from datetime import datetime
-import json
 
 def write_draw_completion_marker(
     log_root: Path,
@@ -1329,7 +1243,7 @@ def write_draw_completion_marker(
         "batch_year": batch_year,
         "basin": basin,
         "draw": draw,
-        "completed_utc": datetime.utcnow().isoformat(),
+        "completed_utc": datetime.now(timezone.utc).isoformat(),
     }
 
     tmp_path = marker_path.with_suffix(".tmp")
@@ -1359,70 +1273,19 @@ def is_draw_completed(
     )
     return marker_path.exists()
 
-# save country storm
-def save_country_storms(
-    loc_ids: list,
-    source_id: str,
-    variant_label: str,
-    experiment_id: str,
-    batch_year: str,
-    basin: str,
-    draw: int,
-    storm_index: int,
-    save_root: Path = COUNTRY_LOG_DIR,
-) -> None:
-    
-    save_root.mkdir(parents=True, exist_ok=True)
-
-    draw_text = "" if draw == 0 else f"_e{draw - 1}"
-    start_year, end_year = batch_year.split("-")
-
-    log_path = (
-        save_root
-        / source_id
-        / variant_label
-        / experiment_id
-        / batch_year
-        / basin
-        / f"country_storms_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}.csv"
-    )
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # create rows
-    df = pd.DataFrame([
-        {
-            "loc_id": loc_id,
-            "source_id": source_id,
-            "variant_label": variant_label,
-            "experiment_id": experiment_id,
-            "batch_year": batch_year,
-            "basin": basin,
-            "draw": draw,
-            "storm_index": storm_index,
-        }
-        for loc_id in loc_ids
-    ])
-
-    # save parquet
-    df.to_parquet(log_path, index=False)
-
 ############################################
 #              Main                        #
 ############################################
         
-def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
-    source_id, variant_label, experiment_id, batch_year, basin, draw, centroids) -> None:
-
+def process_single_storm(
+    storm_index, ds_all, save_root,
+    source_id, variant_label, experiment_id, batch_year, basin, draw,
+    centroids, global_land_gdf,
+) -> None:
     """
-    Process a single storm: compute intensity, speed, exposure, and days impact.
-    This function is intended for parallel execution over storm indices.
-
-    Parameters
-    ----------
-    storm_info : tuple
-        (storm_index, track_store, storm_indices, centroids, save_root,
-         source_id, variant_label, experiment_id, batch_year, basin, draw)
+    Process a single storm: validate existing zarr, compute intensity + exposure,
+    clip to land, and persist both metrics. Errors propagate to the caller, which
+    catches and continues to the next storm.
     """
 
     # Check if storm has already been processed (by checking all three stores)
@@ -1442,70 +1305,63 @@ def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
     # --- Load storm directly from open dataset ---
     ds_track = read_single_storm_from_dataset(ds_all, storm_index)
     tc_tracks = prepare_track_for_climada(ds_track)
+    # start_date is fixed once tc_tracks is built and survives even if
+    # downstream CLIMADA processing raises.
+    start_date = tc_tracks.data[0].attrs.get("start_date")
+
+    # Helper to write the empty-parquet sentinel for no-landfall storms.
+    def _mark_no_landfall(reason: str) -> None:
+        print(f"⚠️ Storm {storm_index} {reason}; writing empty landfall marker.")
+        save_storm_landfall_locations(
+            [],
+            source_id=source_id,
+            variant_label=variant_label,
+            experiment_id=experiment_id,
+            batch_year=batch_year,
+            basin=basin,
+            draw=draw,
+            storm_index=storm_index,
+            start_date=start_date,
+            save_root=save_root,
+        )
 
     haz = generate_hazard_per_track(tc_tracks, centroids)
 
-    storm_intensity = generate_intensity_per_storm(haz, centroids, tc_tracks)
-
-    # check landfall
-    land_gdf = load_land_polygons_for_storm(storm_intensity, GDF_PATH)
-
-    if land_gdf.empty:
-        print(f"⚠️ No land polygons intersect storm {storm_index} bounding box, skipping landfall check and marking as no landfall.")
-        makes_landfall = False
-    else:
-        makes_landfall = check_storm_landfall(storm_intensity, land_gdf, 17) 
-
-
-    if not makes_landfall:
-        print(f"⚠️ Storm {storm_index} does not make landfall, skipping exposure and days impact.")
+    try:
+        storm_intensity = generate_intensity_per_storm(haz, centroids, tc_tracks)
+    except NoIntensityError as e:
+        # CLIMADA produced no intensity output for this storm — treat as no
+        # landfall so future resumes short-circuit before re-running CLIMADA.
+        _mark_no_landfall(f"has no CLIMADA intensity ({e})")
         return
 
-    # track storm duration for logging
-    track_storm_duration(
-        storm_intensity,
-        source_id=source_id,
-        variant_label=variant_label,
-        experiment_id=experiment_id,
-        batch_year=batch_year,
+    if basin == "NA":
+        storm_intensity = normalize_lon_to_180(storm_intensity)
+
+    land_gdf = subset_land_for_storm(
+        global_land_gdf=global_land_gdf,
+        storm_da=storm_intensity,
         basin=basin,
-        draw=draw,
+        buffer=0.25,
     )
 
-    # mask to land
-    storm_intensity = clip_raster_to_land(storm_intensity, land_gdf)
+    if land_gdf.empty:
+        _mark_no_landfall("has no land polygons in bbox")
+        return
 
-    try:
-        loc_ids = get_loc_ids_from_land_da_rra(storm_intensity, land_gdf)
+    # Compute the unioned land geometry once and reuse for landfall check
+    # and both clip_raster_to_land calls (intensity + exposure).
+    land_geom = land_gdf.geometry.union_all()
 
-        # Only save if something was returned
-        if loc_ids:
-            save_country_storms(
-                loc_ids,
-                source_id=source_id,
-                variant_label=variant_label,
-                experiment_id=experiment_id,
-                batch_year=batch_year,
-                basin=basin,
-                draw=draw,
-                storm_index=storm_index,
-            )
+    if not check_storm_landfall(storm_intensity, land_geom, 17):
+        _mark_no_landfall("does not make landfall")
+        return
 
-    except Exception as e:
-        # lightweight, non-blocking logging
-        print(
-            f"[WARN] loc_id extraction failed | "
-            f"storm_index={storm_index}, basin={basin}, draw={draw} | {e}"
-        )
+    storm_intensity = clip_raster_to_land(storm_intensity, land_geom)
 
-    finally:
-        # ensure cleanup if allocated
-        if "loc_ids" in locals():
-            del loc_ids
-
-    # save storm intensity
-    save_single_storm_intensity(
+    save_single_storm_metric(
         storm_intensity,
+        metric="intensity",
         storm_index=storm_index,
         source_id=source_id,
         variant_label=variant_label,
@@ -1515,6 +1371,24 @@ def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
         draw=draw,
         save_root=save_root,
     )
+
+    # Per-location landfall records (uses the same land-clipped intensity)
+    landfall_records = compute_storm_landfall_locations(
+        storm_intensity, land_gdf, wind_threshold=17.0,
+    )
+    save_storm_landfall_locations(
+        landfall_records,
+        source_id=source_id,
+        variant_label=variant_label,
+        experiment_id=experiment_id,
+        batch_year=batch_year,
+        basin=basin,
+        draw=draw,
+        storm_index=storm_index,
+        start_date=start_date,
+        save_root=save_root,
+    )
+
     del storm_intensity
 
     storm_speed = generate_speed_per_storm(haz, centroids, tc_tracks)
@@ -1523,12 +1397,14 @@ def process_single_storm(i, storm_index, ds_all, storm_indices, save_root,
         wind_threshold=17.0,
     )
 
-    # mask to land
-    storm_exposure = clip_raster_to_land(storm_exposure, land_gdf)
+    if basin == "NA":
+        storm_exposure = normalize_lon_to_180(storm_exposure)
 
-    # save exposure
-    save_single_storm_exposure(
+    storm_exposure = clip_raster_to_land(storm_exposure, land_geom)
+
+    save_single_storm_metric(
         storm_exposure,
+        metric="exposure_hours",
         storm_index=storm_index,
         source_id=source_id,
         variant_label=variant_label,
@@ -1591,56 +1467,62 @@ def process_single_draw(draw_info):
         draw=draw,
     )
 
-    # 🔥 Open once for entire draw
+    # Load the basin-appropriate land polygons once per draw; the per-storm
+    # subset uses the gdf's spatial index for fast bbox queries.
+    global_land_gdf = load_global_land_gdf(basin)
+
+    # Open once for entire draw. check_existing_storm_in_zarr inside
+    # process_single_storm validates each storm's structure and skips
+    # (or cleans up) already-completed storms.
     with xr.open_dataset(nc_file) as ds_all:
 
         storm_indices = get_storm_indices(ds_all)
 
         centroids = generate_basin_centroids(basin, res=RESOLUTION)
 
-        for i, storm_index in enumerate(storm_indices):
-            process_single_storm(
-                i,
-                storm_index,
-                ds_all,
-                storm_indices,
-                save_root,
-                source_id,
-                variant_label,
-                experiment_id,
-                batch_year,
-                basin,
-                draw,
-                centroids,
-            )
+        for storm_index in storm_indices:
+            try:
+                process_single_storm(
+                    storm_index,
+                    ds_all,
+                    save_root,
+                    source_id,
+                    variant_label,
+                    experiment_id,
+                    batch_year,
+                    basin,
+                    draw,
+                    centroids,
+                    global_land_gdf,
+                )
+            except Exception as e:
+                print(
+                    f"❌ Storm {storm_index} failed in draw {draw} "
+                    f"({source_id}/{variant_label}/{experiment_id}/{batch_year}/{basin}): "
+                    f"{type(e).__name__}: {e}"
+                )
+                traceback.print_exc()
+                gc.collect()
+                continue
 
 
-    # finalize permissions once per draw
-    draw_store = (
-        save_root
-        / source_id
-        / variant_label
-        / experiment_id
-        / batch_year
-        / basin
+    # finalize permissions once per draw on the zarr stores we actually wrote
+    draw_text = "" if draw == 0 else f"_e{draw - 1}"
+    start_year, end_year = batch_year.split("-")
+    basin_dir = (
+        save_root / source_id / variant_label / experiment_id / batch_year / basin
     )
 
-    metrics = ["intensity", "exposure_hours"]
-
-    for metric in metrics:
-        metric_store = draw_store / metric
-        draw_text = "" if draw == 0 else f"_e{draw - 1}"
-        start_year, end_year = batch_year.split("-")
-
-        final_zarr_path = (
-            metric_store
-            / f"{metric}_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}_final.zarr"
+    for metric in ("intensity", "exposure_hours"):
+        zarr_path = (
+            basin_dir / metric
+            / f"{metric}_{basin}_{source_id}_{experiment_id}_{variant_label}_{start_year}01_{end_year}12{draw_text}.zarr"
         )
-
-        try:
-            chmod_recursive(final_zarr_path, mode=0o775)
-        except Exception as e:
-            print(f"⚠️ Could not set permissions for {final_zarr_path}: {e}")
+        if zarr_path.exists():
+            try:
+                chmod_recursive(zarr_path, mode=0o775)
+            except Exception as e:
+                print(f"⚠️ Could not set permissions for {zarr_path}: {e}")
 
     # log completion of draw as text file
     write_draw_completion_marker(
@@ -1704,17 +1586,3 @@ main(
     draw_batch=draw_batch,
     num_cores=num_cores,
 )
-
-"""
-103 total source_id, variant_label, experiment_id, batch_year combination parameters
-7 total basins
-100 draws per combination
-In total we have 103 * 7 * 100 = 72,100  unique runs to process
-We use multithreading / multiprocessing to parallelize each task over thier given storms
-
-
-Single draw with 8 cores takes approximately 1-15 minutes and 15-25GB of memory
-
-
-
-"""

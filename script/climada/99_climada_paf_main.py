@@ -507,7 +507,7 @@ def generate_intensity_per_storm(
 #    Reading in Functions   #
 #############################
 
-def load_relative_risk_df(relative_risk: str,root: Path = Path("/mnt/share/homes/mfiking/github_repos/climada_python/data/")):
+def load_relative_risk_df(relative_risk: str,root: Path = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/relative_risk_samples/")):
     relative_risk_df = pd.read_csv(root / f"{relative_risk}_rr_samples.csv")
 
     return relative_risk_df

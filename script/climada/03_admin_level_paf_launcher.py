@@ -1,88 +1,171 @@
-import getpass
-import re
-import uuid
-import pandas as pd # type: ignore
-from jobmon.client.status_commands import workflow_tasks, task_status # type: ignore
-from jobmon.client.tool import Tool # type: ignore
-from pathlib import Path
-import os
+import subprocess
 import sys
-from rra_tools.parallel import run_parallel # type: ignore
-import math 
-import xarray as xr # type: ignore
+import uuid
+import numpy as np  # type: ignore
+import pandas as pd  # type: ignore
+from jobmon.client.tool import Tool  # type: ignore
+from pathlib import Path
 
 RELATIVE_RISKS = ["indirect_resp_draw", "indirect_cvd_draw"]
 
+STORM_DRAW_TABLE_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/storm_draw_table.csv")
 
-def assign_resources_single_core(row: pd.Series) -> pd.Series:
-    # n_admin0 = row["num_admin0_first_year"]
-    # n_years = row["num_years_in_batch"]
+# ── Admin level ───────────────────────────────────────────────────────────────
+# Set to 0 or 1. Controls which metadata parquet, shapefile, and output root
+# are used. All other launcher logic is identical across levels.
+ADMIN_LEVEL = 1
 
-    # # --- Runtime estimation ---
-    # slope_per_admin0 = (65.8 - 4.7) / (43 - 8)
-    # base_runtime_for_5yrs = 4.7 - slope_per_admin0 * 8
+if ADMIN_LEVEL == 0:
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2/")
+    META_PARQUET = Path(
+        "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin0_count.parquet"
+    )
+    GENERATE_SCRIPT = Path(__file__).resolve().parent / "generate_storm_draw_admin0_count.py"
+    METRIC_COLS = [
+        "n_storms_in_batch", "estimated_storms_per_year", "year",
+        "num_admin0_first_year", "num_years_in_batch", "estimated_admin0_total",
+    ]
+    _ESTIMATED_TOTAL_COL = "estimated_admin0_total"
+    # Derived from workflow 584066 (8 priority draws): observed max 88G / 45min.
+    # Memory capped at 50G; ×2 retry gives 100G on attempt 2.
+    _RESOURCE_TABLE = pd.DataFrame([
+        {"resource_bin": "heavy", "memory_gb_assigned": 50, "runtime_min_assigned": 50},
+        {"resource_bin": "light", "memory_gb_assigned": 50, "runtime_min_assigned": 35},
+    ])
+elif ADMIN_LEVEL == 1:
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2_admin1/")
+    META_PARQUET = Path(
+        "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count.parquet"
+    )
+    GENERATE_SCRIPT = Path(__file__).resolve().parent / "generate_storm_draw_admin1_count.py"
+    METRIC_COLS = [
+        "n_storms_in_batch", "estimated_storms_per_year", "year",
+        "num_admin1_first_year", "num_years_in_batch", "estimated_admin1_total",
+    ]
+    _ESTIMATED_TOTAL_COL = "estimated_admin1_total"
+    # Admin1 resources from priority draw profiling.
+    # heavy (0–100): max 3.61G / 7min  → 4G / 8min
+    # light (100+):  max 9.80G / 4min  → 10G / 5min
+    # default (estimated_admin1_total == 0, SP/SI tasks with storms in later
+    # years but no year-1 admin1 intersection): 8G / 8min
+    _RESOURCE_TABLE = pd.DataFrame([
+        {"resource_bin": "heavy", "memory_gb_assigned": 4, "runtime_min_assigned": 8},
+        {"resource_bin": "light", "memory_gb_assigned": 10, "runtime_min_assigned": 5},
+    ])
+    DEFAULT_MAX_RUN_TIME_MIN = 8
+    DEFAULT_MEMORY_GB = 8
+else:
+    raise ValueError(f"ADMIN_LEVEL must be 0 or 1, got {ADMIN_LEVEL!r}")
 
-    # runtime_min = (base_runtime_for_5yrs + slope_per_admin0 * n_admin0) * (n_years / 5)
+UNIQUE_KEYS = ["source_id", "variant_label", "experiment_id", "batch_year", "basin"]
 
-    # # enforce minimum runtime
-    # runtime_min = max(runtime_min, 4)
+_RESOURCE_BINS   = [0, 100, np.inf]
+_RESOURCE_LABELS = ["heavy", "light"]
 
-    # # round to nearest 5 minutes
-    # runtime_rounded = int(round(runtime_min / 5) * 5)
-    # runtime_rounded = max(runtime_rounded, 5)
-
-    # # --- Memory estimation ---
-    # if n_admin0 <= 8:
-    #     memory_gb = 20
-    # elif n_admin0 <= 21:
-    #     memory_gb = 20 + (26 - 20) * (n_admin0 - 8) / (21 - 8)
-    # elif n_admin0 <= 43:
-    #     memory_gb = 26 + (61 - 26) * (n_admin0 - 21) / (43 - 21)
-    # else:
-    #     memory_gb = 61 + (n_admin0 - 43) * (61 - 26) / (43 - 21)
-
-    # # round to nearest 4 GB
-    # memory_rounded = int(round(memory_gb / 4) * 4)
-    # memory_rounded = max(memory_rounded, 4)
-
-    # # round runtime to nearest 5 minutes
-    # runtime_rounded = int(round(runtime_rounded / 5) * 5)
-    # runtime_rounded = max(runtime_rounded, 5)
-
-    # basin = row["basin"]
-
-    # # if basin in AU or EP
-    # if basin in ["AU", "EP"]:
-    #     memory_rounded = memory_rounded * 2
-    #     runtime_rounded = runtime_rounded * 2
-
-    # row["num_cores"] = 1
-    # row["max_run_time"] = runtime_rounded
-    # row["memory_req"] = f"{memory_rounded}G"
-
-    # # bin memory into 20, 28, 36, 44, 52, 60, 68
-    # memory_bins = [20, 28, 36, 44, 52, 60, 68]
-    # memory_rounded = min(memory_bins, key=lambda x: abs(x - memory_rounded))
-    # row["memory_req"] = f"{memory_rounded}G"
-
-    # # bin runtime into 5, 10, 30, 60
-    # runtime_bins = [5, 10, 30, 60]
-    # runtime_rounded = min(runtime_bins, key=lambda x: abs(x - runtime_rounded))
-    # row["max_run_time"] = runtime_rounded
-
-    # for testing baseline
-    row["num_cores"] = 1
-    row["max_run_time"] = 10
-    row["memory_req"] = "25G"
-        
-    return row
+if not META_PARQUET.exists():
+    print(f"Metadata parquet not found at {META_PARQUET}. Running generation script...")
+    subprocess.run([sys.executable, str(GENERATE_SCRIPT)], check=True)
+    print("Generation complete.")
 
 
-meta_df = pd.read_parquet("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin0_count.parquet")
+def _stage3_paf_path(
+    storm_draw: str,
+    source_id: str,
+    variant_label: str,
+    experiment_id: str,
+    batch_year: str,
+    basin: str,
+    relative_risk: str,
+    sample_name: str,
+    year: int,
+) -> Path:
+    """Path to a single year's per-admin PAF parquet. Must match the format
+    written by `save_batch_paf_dataframe` in 03_admin_level_paf_main.py."""
+    start_year, end_year = batch_year.split("-")
+    return (
+        SAVE_ROOT
+        / storm_draw / source_id / variant_label / experiment_id
+        / batch_year / basin / str(year) / "paf_df"
+        / (
+            f"paf_{storm_draw}_{relative_risk}_{sample_name}_{basin}_"
+            f"{source_id}_{experiment_id}_{variant_label}_"
+            f"{start_year}01_{end_year}12_{year}.parquet"
+        )
+    )
 
 
-# Assign run times based on storm counts
-full_tasks_df = meta_df.apply(assign_resources_single_core, axis=1)
+def task_is_complete(row) -> bool:
+    """A stage-3 task is complete iff every year in its batch_year has a
+    paf parquet on disk that's at least 1 KB. Mirrors the existence + size
+    check in `check_if_year_complete`; skips the parquet header validity
+    test (the main script's resume logic will catch and rebuild invalid
+    files at runtime)."""
+    start_year, end_year = map(int, row["batch_year"].split("-"))
+    for year in range(start_year, end_year + 1):
+        path = _stage3_paf_path(
+            storm_draw=row["storm_draw"],
+            source_id=row["source_id"],
+            variant_label=row["variant_label"],
+            experiment_id=row["experiment_id"],
+            batch_year=row["batch_year"],
+            basin=row["basin"],
+            relative_risk=row["relative_risk"],
+            sample_name=row["sample_name"],
+            year=year,
+        )
+        if not path.exists() or path.stat().st_size < 1024:
+            return False
+    return True
+
+
+# Resource constants applied uniformly to every task. (A piecewise-linear
+# estimator scaled by admin0 count + batch length used to live here; it's
+# preserved in git history. Reintroduce only if memory / runtime profiling
+# justifies the complexity.)
+DEFAULT_NUM_CORES = 1
+DEFAULT_MAX_RUN_TIME_MIN = 10
+DEFAULT_MEMORY_GB = 10
+
+
+def assign_resources(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["num_cores"] = DEFAULT_NUM_CORES
+    df["max_run_time"] = DEFAULT_MAX_RUN_TIME_MIN
+    df["memory_gb"] = DEFAULT_MEMORY_GB
+    df["resource_bin"] = pd.cut(
+        df[_ESTIMATED_TOTAL_COL], bins=_RESOURCE_BINS, labels=_RESOURCE_LABELS, right=True
+    ).astype(str)
+    df = df.merge(_RESOURCE_TABLE, on="resource_bin", how="left")
+    matched = df["memory_gb_assigned"].notna()
+    df.loc[matched, "memory_gb"] = df.loc[matched, "memory_gb_assigned"].astype(int)
+    df.loc[matched, "max_run_time"] = df.loc[matched, "runtime_min_assigned"].astype(int)
+    df = df.drop(columns=["resource_bin", "memory_gb_assigned", "runtime_min_assigned"])
+    print(f"Resources: {matched.sum()} tasks from table, {(~matched).sum()} using defaults.")
+    print(
+        f"Memory range: {df['memory_gb'].min()}G-{df['memory_gb'].max()}G | "
+        f"Runtime: {df['max_run_time'].min()}-{df['max_run_time'].max()} min"
+    )
+    return df
+
+
+meta_df = pd.read_parquet(META_PARQUET)
+
+# The parquet contains metrics for 8 representative draws (one per unique
+# source_id/variant_label). Propagate those metrics to all 100 storm draws
+# by joining the full storm draw table on the 5-tuple keys.
+_metrics_df = meta_df[UNIQUE_KEYS + METRIC_COLS].drop_duplicates(subset=UNIQUE_KEYS)
+_storm_draw_df = pd.read_csv(STORM_DRAW_TABLE_PATH)
+_storm_draw_df["storm_draw"] = _storm_draw_df["storm_draw"].apply(lambda x: f"storm_draw_{x:04d}")
+_task_combos = meta_df[UNIQUE_KEYS].drop_duplicates()
+
+full_tasks_df = (
+    _storm_draw_df
+    .merge(_task_combos, on=["source_id", "variant_label"], how="inner")
+    .merge(_metrics_df, on=UNIQUE_KEYS, how="left")
+)
+print(f"Task list: {len(full_tasks_df)} rows across {full_tasks_df['storm_draw'].nunique()} storm draws.")
+
+full_tasks_df = assign_resources(full_tasks_df)
 
 # order tasks
 combo_cols = ["source_id", "variant_label"]
@@ -103,67 +186,42 @@ full_tasks_df = full_tasks_df.sort_values(
         "experiment_id",
         "batch_year",
         "basin",
-        "memory_req",
-        "max_run_time",
     ]
 ).reset_index(drop=True)
 
 ##################
-priority = [
-    "storm_draw_0002",
-    "storm_draw_0004",
-    "storm_draw_0005",
-    "storm_draw_0007",
-    "storm_draw_0008",
-    "storm_draw_0003",
-    "storm_draw_0006",
+# High-priority storm_draws (kept in priority order for queue placement).
+PRIORITY_DRAWS = [
     "storm_draw_0001",
+    "storm_draw_0002",
+    "storm_draw_0003",
+    "storm_draw_0009",
+    "storm_draw_0013",
+    "storm_draw_0050",
+    "storm_draw_0057",
+    "storm_draw_0081",
 ]
 
-# subset to first 8 storm draws for testing
-full_tasks_df = full_tasks_df[~full_tasks_df["storm_draw"].isin(priority)]
+# Which subset of storm_draws to submit:
+#   "non_priority" — submit everything EXCEPT PRIORITY_DRAWS (default state)
+#   "priority"     — submit ONLY PRIORITY_DRAWS (for testing / smoke runs)
+#   "all"          — submit every storm_draw, priority ones first
+PRIORITY_MODE = "all"
+
+if PRIORITY_MODE == "non_priority":
+    full_tasks_df = full_tasks_df[~full_tasks_df["storm_draw"].isin(PRIORITY_DRAWS)]
+elif PRIORITY_MODE == "priority":
+    full_tasks_df = full_tasks_df[full_tasks_df["storm_draw"].isin(PRIORITY_DRAWS)]
+elif PRIORITY_MODE == "all":
+    pass  # keep everything, priority-ordered by the upstream sort
+else:
+    raise ValueError(
+        f"Invalid PRIORITY_MODE={PRIORITY_MODE!r}; "
+        f"expected one of: 'non_priority', 'priority', 'all'."
+    )
 
 ########################################################
-# workflow_id1 = 558358 # priority storm draws
-# workflow_id2 = 558359 # priority storm draws
-# workflow_id3 = 558361 # priority storm draws
-
-workflow_id1 = 558799
-workflow_id2 = 559012
-workflow_id3 = 559296
-workflow_id4 = 559449
-workflow_id5 = 559686
-workflow_id6 = 559817
-workflow_ids = [workflow_id1, workflow_id2, workflow_id3, workflow_id4, workflow_id5, workflow_id6]
-
-total_df_list = []
-
-for workflow_id in workflow_ids:
-    df = workflow_tasks(
-        workflow_id=workflow_id,
-        limit=-1   # return all tasks
-    )
-    completed_df = df[df["STATUS"] == "D"]
-    total_df_list.append(completed_df)
-
-
-total_df = pd.concat(total_df_list, ignore_index=True)
-
-# Create completed parameters df
-parts = total_df["TASK_NAME"].str.split("_", expand=True)
-
-complete_parameters = pd.DataFrame({
-    "storm_draw": "storm_draw_" + parts[4],
-    "source_id": parts[5].str.removeprefix("src"),
-    "variant_label": parts[6].str.removeprefix("var"),
-    "experiment_id": parts[7].str.removeprefix("exp"),
-    "batch_year": parts[8].str.removeprefix("yr"),
-    "basin": parts[9],
-    "relative_risk": parts[10] + "_" + parts[11] + "_" + parts[12],
-    "sample_name": parts[13] + "_" + parts[14],
-})
-
-
+# Fan out (indirect_resp_draw, indirect_cvd_draw) into separate rows.
 rr_cols = ["indirect_cvd_draw", "indirect_resp_draw"]
 
 final_long = full_tasks_df.melt(
@@ -175,56 +233,49 @@ final_long = full_tasks_df.melt(
         "basin",
         "storm_draw",
         "max_run_time",
-        "memory_req",
+        "memory_gb",
         "num_cores",
     ],
     value_vars=rr_cols,
     var_name="relative_risk",
     value_name="sample_name",
 )
-# remaining_long = final_long.copy()
 
-remaining_long = final_long.merge(
-    complete_parameters,
-    on=[
-        "source_id",
-        "variant_label",
-        "experiment_id",
-        "batch_year",
-        "basin",
-        "storm_draw",
-        "relative_risk",
-    ],
-    how="left",
-    indicator=True,
+############################################################################################
+# Completion derivation (filesystem-based, not Jobmon-based).
+#
+# A stage-3 task writes one paf parquet per year in batch_year. A task is
+# complete iff every year's parquet exists and is at least 1 KB. Mirrors
+# stage 2's launcher pattern. This also fixes a latent merge bug in the
+# prior Jobmon-based completion: the old merge on= list omitted sample_name,
+# so any one completed sample for a 7-tuple silently marked all other
+# samples for the same 7-tuple as done. task_is_complete keys on the full
+# 8-tuple, so each sample is now evaluated independently.
+completed_mask = final_long.apply(task_is_complete, axis=1)
+remaining_long = final_long[~completed_mask].copy()
+print(
+    f"Completion scan: {completed_mask.sum()} / {len(final_long)} tasks "
+    f"already done on disk; {len(remaining_long)} tasks to submit."
 )
 
-remaining_long = remaining_long[remaining_long["_merge"] == "left_only"].copy()
-
-# # multiply max_run_time by 3
-remaining_long["max_run_time"] = remaining_long["max_run_time"] * 3
-
-# # multiply memory_req by 3
-remaining_long["memory_req"] = remaining_long["memory_req"].str.replace("G", "").astype(int) * 3
-remaining_long["memory_req"] = remaining_long["memory_req"].astype(str) + "G"
+# Format memory as a "{int}G" string for Jobmon's resource spec at the very
+# last moment (kept as int up to this point for clean arithmetic).
+remaining_long["memory_req"] = remaining_long["memory_gb"].astype(str) + "G"
 
 ###############################################################
-user = getpass.getuser()
-
-# Project
-project = "proj_rapidresponse"  # Adjust this to your project name if needed
-
-# create jobmon jobs
-user = getpass.getuser()
+project = "proj_rapidresponse"
 wf_uuid = uuid.uuid4()
 
-# Create a tool
-tool = Tool(name="CLIMADA_stage3")
+# Path to the worker script (resolved relative to this launcher so the repo
+# can be moved without breaking the command).
+MAIN_SCRIPT = Path(__file__).resolve().parent / "03_admin_level_paf_main.py"
+
+tool = Tool(name=f"CLIMADA_stage3_admin{ADMIN_LEVEL}")
 
 
 # Create a workflow, and set the executor
 workflow = tool.create_workflow(
-    name=f"CLIMADA_stage3_{wf_uuid}",
+    name=f"CLIMADA_stage3_admin{ADMIN_LEVEL}_{wf_uuid}",
     # max_concurrently_running = 100,
 )
 
@@ -252,7 +303,7 @@ for _, config in unique_configs.iterrows():
     config_key = f"{config['max_run_time']}_{config['num_cores']}_{config['memory_req']}"
     
     task_templates[config_key] = tool.get_task_template(
-        template_name=f"CLIMADA_stage3_{config_key}",
+        template_name=f"CLIMADA_stage3_admin{ADMIN_LEVEL}_{config_key}",
         default_cluster_name="slurm",
         default_compute_resources={
             "queue": "all.q",
@@ -262,12 +313,12 @@ for _, config in unique_configs.iterrows():
             "project": project,
         },
         default_resource_scales={
-            "memory": 2,  # scale memory by 100% on retry
-            "runtime": lambda x: int(x*1.25),  # scale runtime by 25%
+            "memory": 1.25,
+            "runtime": 1.75,
         },
         max_attempts=5,
         command_template=(
-            "python /ihme/homes/mfiking/github_repos/climada_python/script/climada/03_admin_level_paf_main.py "
+            f"python {MAIN_SCRIPT} "
             "--storm_draw {storm_draw} "
             "--source_id {source_id} "
             "--variant_label {variant_label} "
@@ -276,18 +327,13 @@ for _, config in unique_configs.iterrows():
             "--basin {basin} "
             "--relative_risk {relative_risk} "
             "--sample_name {sample_name} "
-            "--num_cores {num_cores}"
+            "--num_cores {num_cores} "
+            f"--admin_level {ADMIN_LEVEL}"
         ),
         node_args=["storm_draw", "source_id", "variant_label", "experiment_id", "batch_year", "basin", "relative_risk", "sample_name", "num_cores"],
         task_args=[],
         op_args=[],
     )
-
-# delete sample_name_y
-remaining_long = remaining_long.drop(columns=["sample_name_y", "_merge"])
-# rename sample_name_x to sample_name
-remaining_long = remaining_long.rename(columns={"sample_name_x": "sample_name"})
-
 
 # Create tasks using the appropriate template
 tasks = []
@@ -297,7 +343,7 @@ for row in remaining_long.itertuples():
 
     task = template.create_task(
         name=(
-            f"CLIMADA_stage3_"
+            f"CLIMADA_stage3_a{ADMIN_LEVEL}_"
             f"sd{row.storm_draw}_"
             f"src{row.source_id}_"
             f"var{row.variant_label}_"
@@ -337,12 +383,14 @@ else:
 
 try:
     workflow.bind()
-    print("✅ Workflow successfully bound.")
-    print(f"Running workflow with ID {workflow.workflow_id}.")
-    print("For full information see the Jobmon GUI:")
-    print(f"https://jobmon-gui.ihme.washington.edu/#/workflow/{workflow.workflow_id}")
 except Exception as e:
     print(f"❌ Workflow binding failed: {e}")
+    raise SystemExit(1)
+
+print("✅ Workflow successfully bound.")
+print(f"Running workflow with ID {workflow.workflow_id}.")
+print("For full information see the Jobmon GUI:")
+print(f"https://jobmon-gui.ihme.washington.edu/#/workflow/{workflow.workflow_id}")
 
 try:
     status = workflow.run()
