@@ -6,7 +6,7 @@ with all per-(storm × loc) tasks as upstream dependencies.
 
 Path enumeration uses 4A's `compiled_admin_level_metadata.parquet` (which
 already carries the `year` column the 4B launcher loses) instead of
-crawling the stage4b_v2 tree.  At 35M+ expected paths we never
+crawling the stage4b_v3 tree.  At 35M+ expected paths we never
 materialize a list of `Path` objects — chunks are sliced directly from
 the metadata DataFrame and each worker constructs path strings on the
 fly while reading.
@@ -35,11 +35,11 @@ ADMIN_LEVEL = args.admin_level
 
 CLIMADA_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada")
 COMPILED_4A_PARQUET = (
-    CLIMADA_ROOT / "output" / f"stage4a_metadata_admin{ADMIN_LEVEL}"
+    CLIMADA_ROOT / "output" / f"stage4a_metadata_v3_admin{ADMIN_LEVEL}"
     / "compiled_admin_level_metadata.parquet"
 )
 
-SAVE_ROOT = CLIMADA_ROOT / "output" / f"stage4b_v2{'_admin1' if ADMIN_LEVEL == 1 else ''}"
+SAVE_ROOT = CLIMADA_ROOT / "output" / f"stage4b_v3{'_admin1' if ADMIN_LEVEL == 1 else ''}"
 CONSOLIDATED_DIR = SAVE_ROOT / "_consolidated"
 CONSOLIDATED_PARQUET = CONSOLIDATED_DIR / "storm_exposure_all.parquet"
 PARTS_DIR = CONSOLIDATED_DIR / "parts"
@@ -116,7 +116,6 @@ def _read_chunk(meta_chunk: pd.DataFrame) -> pd.DataFrame:
             df["source_id_variant_label"] = f"{row.source_id}_{row.variant_label}"
             df["experiment_id"] = row.experiment_id
             df["basin"] = row.basin
-            df = df.drop(columns=["special_region_flag"], errors="ignore")
             dfs.append(df)
         except FileNotFoundError:
             continue
@@ -142,7 +141,17 @@ def _chunk_batches(df: pd.DataFrame, chunk_size: int, batch_chunks: int):
         yield batch
 
 
-def _load_manifest_done() -> set[int]:
+def _inventory_signature(meta_df: pd.DataFrame) -> str:
+    """Identify the inventory a part file was built from. batch_idx alone is
+    not enough: after 4A/4B re-run, the same batch index covers different
+    rows/outputs, and reusing an old part would mix stale data into the
+    consolidated parquet."""
+    st = COMPILED_4A_PARQUET.stat()
+    return f"{st.st_size}-{st.st_mtime_ns}-{len(meta_df)}-{CHUNK_SIZE}-{BATCH_CHUNKS}"
+
+
+def _load_manifest_done(signature: str) -> set[int]:
+    """Batches recorded as done for this inventory signature only."""
     done: set[int] = set()
     if not MANIFEST_JSONL.exists():
         return done
@@ -155,7 +164,11 @@ def _load_manifest_done() -> set[int]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("status") == "done" and "batch_idx" in rec:
+            if (
+                rec.get("status") == "done"
+                and "batch_idx" in rec
+                and rec.get("signature") == signature
+            ):
                 done.add(int(rec["batch_idx"]))
     return done
 
@@ -199,8 +212,13 @@ def _write_part_file(dfs: list[pd.DataFrame], part_path: Path):
     return rows
 
 
-def _build_master_from_parts() -> int:
-    parts = sorted(PARTS_DIR.glob("part_*.parquet"))
+def _build_master_from_parts(total_batches: int) -> int:
+    # Only this inventory's batch indices: part files left over from an
+    # earlier, larger run (higher indices) must not leak into the master.
+    parts = [
+        p for p in (PARTS_DIR / f"part_{i:06d}.parquet" for i in range(1, total_batches + 1))
+        if p.exists()
+    ]
     if not parts:
         pd.DataFrame().to_parquet(CONSOLIDATED_PARQUET, index=False)
         return 0
@@ -254,7 +272,9 @@ def compile_exposure(meta_df: pd.DataFrame) -> Path:
     CONSOLIDATED_DIR.mkdir(parents=True, exist_ok=True)
     PARTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    done_batches = _load_manifest_done()
+    signature = _inventory_signature(meta_df)
+    done_batches = _load_manifest_done(signature)
+    print(f"Inventory signature {signature}: {len(done_batches):,} batch(es) reusable from the manifest.")
     total_rows_parts = 0
     for batch_idx, chunk_batch in enumerate(
         _chunk_batches(meta_df, CHUNK_SIZE, BATCH_CHUNKS),
@@ -266,6 +286,9 @@ def compile_exposure(meta_df: pd.DataFrame) -> Path:
             print(f"Batch {batch_idx:,}/{total_batches:,}: already done, skipping.")
             continue
 
+        # Remove any part from a different inventory first; a batch that now
+        # yields 0 rows writes no part and must not leave a stale one behind.
+        part_path.unlink(missing_ok=True)
         start_ts = time.time()
         dfs = run_parallel(
             runner=_read_chunk,
@@ -280,6 +303,7 @@ def compile_exposure(meta_df: pd.DataFrame) -> Path:
         _append_manifest(
             {
                 "batch_idx": batch_idx,
+                "signature": signature,
                 "status": "done",
                 "rows": rows,
                 "seconds": round(elapsed, 3),
@@ -293,7 +317,7 @@ def compile_exposure(meta_df: pd.DataFrame) -> Path:
         )
 
     if WRITE_MASTER_PARQUET:
-        total_rows_master = _build_master_from_parts()
+        total_rows_master = _build_master_from_parts(total_batches)
     else:
         total_rows_master = -1
 

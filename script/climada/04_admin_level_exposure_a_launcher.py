@@ -8,7 +8,7 @@ from pathlib import Path
 # ── Admin level ───────────────────────────────────────────────────────────────
 # Set to 0 or 1. Controls output root, task filtering, and the --admin_level
 # flag passed to the main script.
-ADMIN_LEVEL = 1
+ADMIN_LEVEL = 0
 
 # ── Completion scan ───────────────────────────────────────────────────────────
 # True  — walk the output tree to skip already-completed draws (normal mode).
@@ -18,11 +18,11 @@ CHECK_COMPLETION = False
 DRAW_BATCHES = [f"{i}-{i}" for i in range(100)]
 
 SAVE_ROOT = Path(
-    f"/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4a_metadata_admin{ADMIN_LEVEL}"
+    f"/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4a_metadata_v3_admin{ADMIN_LEVEL}"
 )
 
 ADMIN1_META_PARQUET = Path(
-    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count.parquet"
+    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count_v3.parquet"
 )
 _UNIQUE_KEYS = ["source_id", "variant_label", "experiment_id", "batch_year", "basin"]
 

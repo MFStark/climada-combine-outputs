@@ -40,7 +40,7 @@ ADMIN_LEVEL = args.admin_level
 # Constants
 # ----------------------------------------------------------------------
 CLIMADA_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada")
-SAVE_ROOT = CLIMADA_ROOT / "output" / f"stage4a_metadata_admin{ADMIN_LEVEL}"
+SAVE_ROOT = CLIMADA_ROOT / "output" / f"stage4a_metadata_v3_admin{ADMIN_LEVEL}"
 META_CSV = CLIMADA_ROOT / "input" / "cmip6" / "level_4_task_assignments.csv"
 
 DRAWS = list(range(100))
@@ -49,7 +49,9 @@ BASELINE_BATCH_YEAR = "1965-1969"  # historical baseline; excluded from stage 4
 PIXEL_SIZE_M = 100
 PIXEL_AREA_M2 = PIXEL_SIZE_M ** 2  # 100 m × 100 m = 10,000 m²
 
-# loc_id 22 = India at admin0; empirically heavier than pixel count suggests.
+# loc_id 22 = Fiji at admin0; empirically heavier than pixel count suggests
+# (its piece east of 180° used to get a globe-wide population window in 4B;
+# fixed 2026-10-08 via to_pm180 — re-evaluate this override after the rerun).
 # Not applicable at admin1 (different location_id space).
 LOC_ID_OVERRIDE_VERY_LARGE = 22 if ADMIN_LEVEL == 0 else None
 

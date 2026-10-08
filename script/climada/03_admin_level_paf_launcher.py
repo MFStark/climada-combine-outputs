@@ -13,12 +13,12 @@ STORM_DRAW_TABLE_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/storm_
 # ── Admin level ───────────────────────────────────────────────────────────────
 # Set to 0 or 1. Controls which metadata parquet, shapefile, and output root
 # are used. All other launcher logic is identical across levels.
-ADMIN_LEVEL = 1
+ADMIN_LEVEL = 0
 
 if ADMIN_LEVEL == 0:
-    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2/")
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v3/")
     META_PARQUET = Path(
-        "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin0_count.parquet"
+        "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin0_count_v3.parquet"
     )
     GENERATE_SCRIPT = Path(__file__).resolve().parent / "generate_storm_draw_admin0_count.py"
     METRIC_COLS = [
@@ -33,9 +33,9 @@ if ADMIN_LEVEL == 0:
         {"resource_bin": "light", "memory_gb_assigned": 50, "runtime_min_assigned": 35},
     ])
 elif ADMIN_LEVEL == 1:
-    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v2_admin1/")
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage3_v3_admin1/")
     META_PARQUET = Path(
-        "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count.parquet"
+        "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count_v3.parquet"
     )
     GENERATE_SCRIPT = Path(__file__).resolve().parent / "generate_storm_draw_admin1_count.py"
     METRIC_COLS = [

@@ -15,6 +15,7 @@ from rasterio.features import shapes  # type: ignore
 from rasterio.errors import WindowError  # type: ignore
 from rasterra import RasterArray  # type: ignore
 import shapely
+import shapely.affinity  # type: ignore
 from shapely.geometry import (
     box,
     shape,
@@ -54,9 +55,9 @@ ADMIN_LEVEL = args.admin_level
 
 
 # Constants
-ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2")
+ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v3")
 SAVE_ROOT = Path(
-    f"/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4a_metadata_admin{ADMIN_LEVEL}"
+    f"/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4a_metadata_v3_admin{ADMIN_LEVEL}"
 )
 
 GDF_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/")
@@ -107,18 +108,44 @@ def normalize_geom_to_0_360(geom):
         return x + 360 if x < 0 else x, y
     return shapely.ops.transform(shift_x, geom)
 
+_WEST_OF_180 = box(-360, -90, 180, 90)
+_EAST_OF_180 = box(180, -90, 540, 90)
+
+
 def normalize_longitudes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Shift geometries with x > 180 to x - 360 to avoid wraparound issues."""
+    """Move 0-360 geometries to -180..180.
+
+    Geometries entirely east of 180 are translated by -360. Geometries that
+    straddle 180 (e.g. Russia's Chukotka ring, Antarctica) are cut at 180
+    first and only the eastern part is translated; shifting vertex-by-vertex
+    would instead turn such a ring into an invalid shape spanning 360°.
+    """
     def shift_geom(geom):
-        if geom.is_empty:
+        if geom is None or geom.is_empty:
             return geom
-        def shift_coords(x, y, z=None):
-            x_new = x - 360 if x > 180 else x
-            return (x_new, y) if z is None else (x_new, y, z)
-        return shapely.ops.transform(shift_coords, geom)
+        minx, _, maxx, _ = geom.bounds
+        if maxx <= 180:
+            return geom
+        if minx >= 180:
+            return shapely.affinity.translate(geom, xoff=-360)
+        west = geom.intersection(_WEST_OF_180)
+        east = shapely.affinity.translate(geom.intersection(_EAST_OF_180), xoff=-360)
+        return _polygonize(unary_union([west, east]))
     gdf = gdf.copy()
     gdf["geometry"] = gdf["geometry"].apply(shift_geom)
     return gdf
+
+
+def to_pm180(geom):
+    """Translate a 0-360 geometry lying entirely east of 180 back to -180..180.
+
+    Used before reprojecting a piece's bbox to CEA: pyproj maps lon 180 to
+    +20,037 km but lon 181 to about -19,900 km, so a piece spanning 180..182
+    would otherwise yield a globe-wide (40,075 km) population window.
+    """
+    if geom.is_empty or geom.bounds[0] < 180:
+        return geom
+    return shapely.affinity.translate(geom, xoff=-360)
 
 def normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     ds = ds.assign_coords(
@@ -133,11 +160,30 @@ def to_raster(
     lat_col: str = "lat",
     lon_col: str = "lon",
     crs: str = "EPSG:4326",
+    expected_res: float | None = None,
 ) -> rt.RasterArray:
     lat, lon = ds[lat_col].data, ds[lon_col].data
 
     dlat = (lat[1:] - lat[:-1]).mean()
     dlon = (lon[1:] - lon[:-1]).mean()
+
+    # The affine transform assumes a regular grid at the stage 1 resolution.
+    # Stage 1 outputs written before the grid fix are evenly spaced at the
+    # WRONG step, so check the step itself, not just uniformity.
+    if expected_res is not None:
+        target_lat, target_lon = expected_res, expected_res
+    else:
+        target_lat, target_lon = abs(dlat), abs(dlon)
+    if not (
+        np.allclose(np.abs(np.diff(lat)), target_lat, atol=1e-6)
+        and np.allclose(np.abs(np.diff(lon)), target_lon, atol=1e-6)
+    ):
+        raise ValueError(
+            f"to_raster requires coords uniformly spaced at "
+            f"{expected_res if expected_res is not None else 'a constant step'}; "
+            f"got lat steps {np.unique(np.round(np.diff(lat), 6))}, "
+            f"lon steps {np.unique(np.round(np.diff(lon), 6))}"
+        )
 
     # 🔑 detect latitude direction
     lat_increasing = lat[1] > lat[0]
@@ -988,7 +1034,14 @@ def check_if_draw_is_complete(
 ###########################################
 #                Main                     #
 ###########################################
-def process_single_draw(args):
+def process_single_draw(args) -> list:
+    """
+    Gather per-(storm × admin) metadata for one draw. Returns a list of
+    (year, storm_id, reason) failures. A storm with a failed admin is not
+    saved, a year with a failed storm is not aggregated, and the draw-level
+    parquet is only written when nothing failed, so retries recompute exactly
+    the missing pieces and 4B never sees a silently incomplete task list.
+    """
     (
         source_id,
         variant_label,
@@ -1010,18 +1063,25 @@ def process_single_draw(args):
         draw,
     ):
         print(f"Skipping draw: {draw} (already complete)")
-        return None
+        return []
 
-    intensity_draw_store = get_draw_zarr_path(
-        source_id=source_id,
-        variant_label=variant_label,
-        experiment_id=experiment_id,
-        batch_year=batch_year,
-        basin=basin,
-        draw=draw,
-        metric="intensity",
-    )
+    try:
+        intensity_draw_store = get_draw_zarr_path(
+            source_id=source_id,
+            variant_label=variant_label,
+            experiment_id=experiment_id,
+            batch_year=batch_year,
+            basin=basin,
+            draw=draw,
+            metric="intensity",
+        )
+    except FileNotFoundError:
+        # Stage 1 only creates a draw store once a storm makes landfall.
+        print(f"⚠️ Draw {draw} has no Stage 1 intensity store (no landfalling storms) → nothing to do.")
+        return []
 
+    # Intensity exists, so exposure must too; a missing exposure store raises
+    # and is recorded as a failure by main().
     exposure_draw_store = get_draw_zarr_path(
         source_id=source_id,
         variant_label=variant_label,
@@ -1045,8 +1105,8 @@ def process_single_draw(args):
     # ---- Handle empty intensity draws ----
     if intensity_draw_store is None or not any(intensity_draw_store.iterdir()):
         print(f"⚠️ Draw {draw} has no intensity data.")
-        return None
-    
+        return []
+
 
     # ---------------------------------------------------
     # STEP 1: Load storm metadata only
@@ -1057,7 +1117,9 @@ def process_single_draw(args):
     # ---------------------------------------------------
     # STEP 2: Process year-by-year
     # ---------------------------------------------------
+    failures: list[tuple] = []
     for year in all_years:
+        year_failed = False
         print(f"Processing year: {year}")
 
         # check if yearly exposure already complete
@@ -1081,6 +1143,7 @@ def process_single_draw(args):
 
         for storm_path in storm_paths_in_year:
             storm_records = []
+            storm_failed = False
             storm_id = storm_path.name  # fallback for error msg before zarr open
 
             try:
@@ -1110,7 +1173,11 @@ def process_single_draw(args):
                         exposure_draw_store,
                         storm_id,
                     )
-                except (FileNotFoundError, KeyError):
+                except (FileNotFoundError, KeyError) as e:
+                    # Stage 1 wrote intensity for this storm but not exposure.
+                    print(f"❌ Storm {storm_id}: exposure missing in Stage 1 ({e})")
+                    failures.append((year, storm_id, "missing exposure"))
+                    year_failed = True
                     storm_ds.close()
                     continue
 
@@ -1133,7 +1200,8 @@ def process_single_draw(args):
                     no_data_value=np.nan,
                     lat_col="lat",
                     lon_col="lon",
-                    crs="EPSG:4326"
+                    crs="EPSG:4326",
+                    expected_res=template_raster.transform.a,
                 ).resample_to(target=template_raster, resampling="nearest")
 
                 exposure_raster = to_raster(
@@ -1141,7 +1209,8 @@ def process_single_draw(args):
                     no_data_value=np.nan,
                     lat_col="lat",
                     lon_col="lon",
-                    crs="EPSG:4326"
+                    crs="EPSG:4326",
+                    expected_res=template_raster.transform.a,
                 ).resample_to(target=template_raster, resampling="nearest")
 
                 # Clean up
@@ -1176,27 +1245,6 @@ def process_single_draw(args):
                     del intensity_raster, exposure_raster
                     del intersected_shapes
                     continue
-                # ---------------------------------------------------
-                # Generate max windspeed before reprojection
-                # ---------------------------------------------------
-                max_wind_by_loc = {}
-
-                for admin_shape in intersected_shapes.itertuples(index=False):
-                    admin_id = admin_shape.loc_id
-                    admin_geom = admin_shape.geometry
-
-                    try:
-                        admin_intensity = intensity_raster.clip(admin_geom).mask(
-                            admin_geom, all_touched=True
-                        )
-                        arr = admin_intensity._ndarray
-                        max_wind_by_loc[admin_id] = (
-                            float(np.nanmax(arr)) if np.isfinite(arr).any() else np.nan
-                        )
-                    except WindowError:
-                        # more precise than ValueError
-                        max_wind_by_loc[admin_id] = np.nan
-
                 intersected_shapes = reproject_shapefile_to_equal_area(intersected_shapes)
 
                 # ---------------------------------------------------
@@ -1246,7 +1294,7 @@ def process_single_draw(args):
 
                             # Intersect and clip
                             intersection = piece_wgs84.intersection(raster_bounds)
-                            intersection_gdf = gpd.GeoDataFrame(geometry=[intersection], crs="EPSG:4326")
+                            intersection_gdf = gpd.GeoDataFrame(geometry=[to_pm180(intersection)], crs="EPSG:4326")
                             intersection_cea = intersection_gdf.to_crs("ESRI:54034").iloc[0].geometry
                             intersection_cea_bounds = intersection_cea.bounds
 
@@ -1361,10 +1409,15 @@ def process_single_draw(args):
                             f"{basin}, draw {draw}): {type(e).__name__}: {e}"
                         )
                         traceback.print_exc()
+                        failures.append((year, storm_id, f"admin {admin_id}"))
+                        storm_failed = True
                         continue
 
-                # save storm-level exposure immediately
-                if storm_records:
+                # Save storm-level metadata only if every admin succeeded;
+                # otherwise the storm stays incomplete and reruns on retry.
+                if storm_failed:
+                    year_failed = True
+                elif storm_records:
                     storm_df = pd.DataFrame.from_records(storm_records)
                     save_storm_metadata(
                         meta_data=storm_df,
@@ -1393,7 +1446,13 @@ def process_single_draw(args):
                     f"{basin}, draw {draw}): {type(e).__name__}: {e}"
                 )
                 traceback.print_exc()
+                failures.append((year, storm_id, f"storm {type(e).__name__}"))
+                year_failed = True
                 continue
+
+        if year_failed:
+            print(f"❌ Year {year}: storm failures; not aggregating the year.")
+            continue
 
         # Save yearly exposure after processing all storms in the year
         save_yearly_exposure(
@@ -1406,6 +1465,10 @@ def process_single_draw(args):
             draw=draw,
         )
 
+    if failures:
+        print(f"❌ Draw {draw}: {len(failures)} failure(s); not writing the draw-level parquet.")
+        return failures
+
     # save draw-level exposure after processing all years in the draw
     save_draw_dataframe(
         source_id=source_id,
@@ -1415,6 +1478,7 @@ def process_single_draw(args):
         basin=basin,
         draw=draw,
     )
+    return []
 
 
 
@@ -1455,7 +1519,10 @@ def main(grouped_tasks_parquet: str, group_id: int) -> None:
     # Cache basin template rasters — one per unique basin in this group.
     template_cache: dict = {}
 
-    # 2. Run pending draws serially.
+    # 2. Run pending draws serially. A failing draw is recorded and the
+    #    group continues; the task exits non-zero at the end so Jobmon
+    #    retries it (completed draws/years/storms short-circuit on retry).
+    failed_draws: dict = {}
     for i, row in enumerate(pending_rows):
         print(
             f"  [{i + 1}/{len(pending_rows)}] "
@@ -1465,16 +1532,28 @@ def main(grouped_tasks_parquet: str, group_id: int) -> None:
         if row.basin not in template_cache:
             template_cache[row.basin] = generate_basin_template_raster(row.basin, res=0.1)
 
-        process_single_draw((
-            row.source_id,
-            row.variant_label,
-            row.experiment_id,
-            row.batch_year,
-            row.basin,
-            int(row.draw),
-            template_cache[row.basin],
-            ADMIN_LEVEL,
-        ))
+        key = f"{row.source_id}/{row.variant_label}/{row.experiment_id}/{row.batch_year}/{row.basin}/draw{int(row.draw)}"
+        try:
+            failures = process_single_draw((
+                row.source_id,
+                row.variant_label,
+                row.experiment_id,
+                row.batch_year,
+                row.basin,
+                int(row.draw),
+                template_cache[row.basin],
+                ADMIN_LEVEL,
+            ))
+        except Exception as e:
+            print(f"❌ Draw {key} raised {type(e).__name__}: {e}")
+            traceback.print_exc()
+            failures = [("draw", None, f"{type(e).__name__}: {e}")]
+        if failures:
+            failed_draws[key] = failures
+
+    if failed_draws:
+        print(f"❌ {len(failed_draws)} draw(s) incomplete: {failed_draws}")
+        raise SystemExit(1)
 
 
 main(grouped_tasks_parquet, group_id)

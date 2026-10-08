@@ -7,7 +7,7 @@ import numpy as np
 RELATIVE_RISKS = ["indirect_resp_draw", "indirect_cvd_draw"]
 
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2/")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v3/")
 
 
 def _stage2_paf_path(

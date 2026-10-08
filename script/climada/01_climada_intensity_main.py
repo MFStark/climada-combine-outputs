@@ -51,8 +51,8 @@ num_cores = args.num_cores
 
 # Constants
 ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/input/cmip6/")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2/")
-LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2_log/")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v3/")
+LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v3_log/")
 RESOLUTION = 0.1  # degrees
 GDF_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84.parquet")
 SHP_ROOT_NORMALIZED = Path('/snfs1/WORK/11_geospatial/admin_shapefiles/2024_07_29')
@@ -234,6 +234,22 @@ def ensure_min_grid(da: xr.DataArray, buffer_deg: float = 0.1) -> xr.DataArray:
         da = da.reindex(lon=[c-buffer_deg, c, c+buffer_deg], fill_value=np.nan)
 
     return da
+
+
+def crop_to_footprint(da: xr.DataArray) -> xr.DataArray:
+    """
+    Crop to the bounding box of finite values. Interior all-NaN rows/cols
+    (gaps between disjoint footprint pieces) are kept so the lat/lon grid
+    stays uniformly spaced; `dropna(how="all")` would remove them and
+    `to_raster` would then infer a stretched resolution.
+    """
+    valid = da.notnull()
+    rows = np.flatnonzero(valid.any(dim=[d for d in da.dims if d != "lat"]).values)
+    cols = np.flatnonzero(valid.any(dim=[d for d in da.dims if d != "lon"]).values)
+    return da.isel(
+        lat=slice(rows[0], rows[-1] + 1),
+        lon=slice(cols[0], cols[-1] + 1),
+    )
 
 
 def normalize_lon_to_180(da: xr.DataArray) -> xr.DataArray:
@@ -500,8 +516,7 @@ def compute_yearly_exposure_per_storm(
     # ---- For valid storms ----
     # Remove empty space (zeros) outside storm footprint
     yearly_exposure = yearly_exposure.where(yearly_exposure > 0)
-    yearly_exposure = yearly_exposure.dropna(dim="lat", how="all")
-    yearly_exposure = yearly_exposure.dropna(dim="lon", how="all")
+    yearly_exposure = crop_to_footprint(yearly_exposure)
 
 
     # --------------------------------------------------
@@ -599,8 +614,7 @@ def generate_intensity_per_storm(
 
     # ---- Crop to storm footprint in 0–360 ----
     da = da.where(da > 0)
-    da = da.dropna(dim="lat", how="all")
-    da = da.dropna(dim="lon", how="all")
+    da = crop_to_footprint(da)
 
     # --------------------------------------------------
     # Expand single-pixel footprint by creating new grid
@@ -805,6 +819,18 @@ def to_raster(
 
     dlat = (lat[1:] - lat[:-1]).mean()
     dlon = (lon[1:] - lon[:-1]).mean()
+
+    # The affine transform assumes a regular grid; a gap in the coords would
+    # otherwise be silently averaged into a stretched resolution.
+    if not (
+        np.allclose(np.diff(lat), dlat, atol=1e-6)
+        and np.allclose(np.diff(lon), dlon, atol=1e-6)
+    ):
+        raise ValueError(
+            f"to_raster requires uniformly spaced coords; got lat steps "
+            f"{np.unique(np.round(np.diff(lat), 6))}, lon steps "
+            f"{np.unique(np.round(np.diff(lon), 6))}"
+        )
 
     # 🔑 detect latitude direction
     lat_increasing = lat[1] > lat[0]
@@ -1372,21 +1398,11 @@ def process_single_storm(
         save_root=save_root,
     )
 
-    # Per-location landfall records (uses the same land-clipped intensity)
+    # Per-location landfall records (uses the same land-clipped intensity).
+    # Saved only after the exposure zarr below, so the parquet sentinel is
+    # never on disk for a storm whose exposure write didn't happen.
     landfall_records = compute_storm_landfall_locations(
         storm_intensity, land_gdf, wind_threshold=17.0,
-    )
-    save_storm_landfall_locations(
-        landfall_records,
-        source_id=source_id,
-        variant_label=variant_label,
-        experiment_id=experiment_id,
-        batch_year=batch_year,
-        basin=basin,
-        draw=draw,
-        storm_index=storm_index,
-        start_date=start_date,
-        save_root=save_root,
     )
 
     del storm_intensity
@@ -1416,12 +1432,31 @@ def process_single_storm(
     )
     del storm_exposure
 
+    # Completion sentinel — written last (see check_existing_storm_in_zarr).
+    save_storm_landfall_locations(
+        landfall_records,
+        source_id=source_id,
+        variant_label=variant_label,
+        experiment_id=experiment_id,
+        batch_year=batch_year,
+        basin=basin,
+        draw=draw,
+        storm_index=storm_index,
+        start_date=start_date,
+        save_root=save_root,
+    )
 
     del storm_speed
     del tc_tracks, haz
     gc.collect()
 
-def process_single_draw(draw_info):
+def process_single_draw(draw_info) -> list[int]:
+    """
+    Process every storm in one draw. Returns the storm indices that raised;
+    the draw completion marker is only written when that list is empty, so
+    a draw with failed storms is resubmitted (and only the failed storms
+    recompute — completed ones short-circuit on their landfall parquet).
+    """
     (
         source_id,
         variant_label,
@@ -1445,7 +1480,7 @@ def process_single_draw(draw_info):
         draw=draw,
     ):
         print(f"⚠️ Draw {draw} already marked as completed, skipping.")
-        return
+        return []
 
     # check and cleanup any existing stores with partial files before processing
     check_and_cleanup_zarr_store(
@@ -1480,6 +1515,7 @@ def process_single_draw(draw_info):
 
         centroids = generate_basin_centroids(basin, res=RESOLUTION)
 
+        failed_storms: list[int] = []
         for storm_index in storm_indices:
             try:
                 process_single_storm(
@@ -1502,6 +1538,7 @@ def process_single_draw(draw_info):
                     f"{type(e).__name__}: {e}"
                 )
                 traceback.print_exc()
+                failed_storms.append(storm_index)
                 gc.collect()
                 continue
 
@@ -1524,6 +1561,13 @@ def process_single_draw(draw_info):
             except Exception as e:
                 print(f"⚠️ Could not set permissions for {zarr_path}: {e}")
 
+    if failed_storms:
+        print(
+            f"❌ Draw {draw} incomplete: {len(failed_storms)} storm(s) failed "
+            f"{failed_storms}; not writing completion marker."
+        )
+        return failed_storms
+
     # log completion of draw as text file
     write_draw_completion_marker(
         log_root=LOG_DIR,
@@ -1536,6 +1580,7 @@ def process_single_draw(draw_info):
     )
 
     print(f"✅ Completed draw {draw}")
+    return []
 
 def main(
     source_id: str,
@@ -1567,11 +1612,18 @@ def main(
         for draw in draws
     ]
 
-    run_parallel(
+    failed_by_draw = run_parallel(
         runner=process_single_draw,
         arg_list=draw_args,
         num_cores=num_cores,
     )
+
+    incomplete = {d: f for d, f in zip(draws, failed_by_draw) if f}
+    if incomplete:
+        # Non-zero exit so Jobmon marks the task failed and retries it; the
+        # retry skips completed storms and only recomputes the failed ones.
+        print(f"❌ {len(incomplete)} draw(s) incomplete: {incomplete}")
+        raise SystemExit(1)
 
     print("🎉 All draws completed.")
 

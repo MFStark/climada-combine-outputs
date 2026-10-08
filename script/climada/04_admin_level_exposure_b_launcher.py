@@ -8,7 +8,7 @@ from pathlib import Path
 # ── Admin level ───────────────────────────────────────────────────────────────
 # Set to 0 or 1. Controls which resource parquet, output root, and
 # --admin_level flag passed to the main and post-processing scripts.
-ADMIN_LEVEL = 1
+ADMIN_LEVEL = 0
 
 # ── Completion check ──────────────────────────────────────────────────────────
 # True  — skip groups that already have a sentinel on disk (normal resume).
@@ -19,15 +19,15 @@ CHECK_COMPLETION = True
 # Applied AFTER group assignment and sentinel check so group composition (and
 # therefore sentinel hashes) stays identical regardless of multiplier value.
 # Set to 1 for normal runs; 2 to double memory/runtime for retry runs.
-MEMORY_MULTIPLIER = 2
+MEMORY_MULTIPLIER = 1
 RUNTIME_MULTIPLIER = 1
 
 CLIMADA_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output")
-SAVE_ROOT = CLIMADA_ROOT / f"stage4b_v2{'_admin1' if ADMIN_LEVEL == 1 else ''}/"
+SAVE_ROOT = CLIMADA_ROOT / f"stage4b_v3{'_admin1' if ADMIN_LEVEL == 1 else ''}/"
 SENTINEL_DIR = SAVE_ROOT / "_sentinels"
 MAX_GROUP_RUNTIME_MIN = 360
 GROUPED_PARQUET_DIR = (
-    CLIMADA_ROOT / f"stage4a_metadata_admin{ADMIN_LEVEL}" / "_workflow_grouped_tasks_4b"
+    CLIMADA_ROOT / f"stage4a_metadata_v3_admin{ADMIN_LEVEL}" / "_workflow_grouped_tasks_4b"
 )
 
 _GROUP_KEY_COLS = [
@@ -92,7 +92,7 @@ def assign_groups(
 
 # Read resource parquet — keep integer columns numeric for grouping.
 meta_df = pd.read_parquet(
-    CLIMADA_ROOT / f"stage4a_metadata_admin{ADMIN_LEVEL}" / "resource_estimation_all_storms.parquet"
+    CLIMADA_ROOT / f"stage4a_metadata_v3_admin{ADMIN_LEVEL}" / "resource_estimation_all_storms.parquet"
 )
 
 meta_df["basin"] = meta_df["basin"].fillna("NA")

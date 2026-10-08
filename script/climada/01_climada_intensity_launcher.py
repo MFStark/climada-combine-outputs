@@ -129,7 +129,7 @@ full_tasks_df = (
 # per-storm resume logic short-circuits the already-done draws inside it,
 # so cost is minimal — we just pay one task slot for the catch-up draws.
 ######################################################################
-LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2_log/")
+LOG_DIR = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v3_log/")
 MARKER_ROOT = LOG_DIR / "draw_completion_markers"
 
 completed_draws: set[tuple] = set()

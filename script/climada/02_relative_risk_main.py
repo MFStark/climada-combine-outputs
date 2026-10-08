@@ -41,8 +41,8 @@ sample_name = args.sample_name
 num_cores = args.num_cores
 
 # Constants
-ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2")
-SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2")
+ROOT_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v3")
+SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v3")
 
 # Fixed impact duration per storm-affected pixel (days), expressed as a
 # year-fraction for the PAF formula: PAF = (RR - 1) / RR * (days / 365).
@@ -127,11 +127,30 @@ def to_raster(
     lat_col: str = "lat",
     lon_col: str = "lon",
     crs: str = "EPSG:4326",
+    expected_res: float | None = None,
 ) -> rt.RasterArray:
     lat, lon = ds[lat_col].data, ds[lon_col].data
 
     dlat = (lat[1:] - lat[:-1]).mean()
     dlon = (lon[1:] - lon[:-1]).mean()
+
+    # The affine transform assumes a regular grid at the stage 1 resolution.
+    # Stage 1 outputs written before the grid fix are evenly spaced at the
+    # WRONG step, so check the step itself, not just uniformity.
+    if expected_res is not None:
+        target_lat, target_lon = expected_res, expected_res
+    else:
+        target_lat, target_lon = abs(dlat), abs(dlon)
+    if not (
+        np.allclose(np.abs(np.diff(lat)), target_lat, atol=1e-6)
+        and np.allclose(np.abs(np.diff(lon)), target_lon, atol=1e-6)
+    ):
+        raise ValueError(
+            f"to_raster requires coords uniformly spaced at "
+            f"{expected_res if expected_res is not None else 'a constant step'}; "
+            f"got lat steps {np.unique(np.round(np.diff(lat), 6))}, "
+            f"lon steps {np.unique(np.round(np.diff(lon), 6))}"
+        )
 
     # 🔑 detect latitude direction
     lat_increasing = lat[1] > lat[0]
@@ -568,7 +587,10 @@ def get_year_status(
 
 def process_single_draw(draw):
     """
-    Process a single draw of storms and return yearly raw PAF and yearly RR rasters.
+    Process a single draw of storms and return (yearly raw PAF rasters,
+    failures), where failures is a list of (year, storm_id) for storms that
+    raised. A year with any failure must not be saved — its PAF would be
+    silently missing that storm's contribution.
     Uses storm metadata to avoid loading full datasets until necessary.
     """
     (
@@ -606,12 +628,13 @@ def process_single_draw(draw):
     if intensity_draw_store is None or not any(intensity_draw_store.iterdir()):
         yearly_paf = {year: np.zeros_like(template_raster._ndarray, dtype=np.float32) for year in invalid_years}
         print(f"⚠️ Draw {draw} has no intensity data. Returning empty rasters for basin {basin}, batch {batch_year}")
-        return yearly_paf
+        return yearly_paf, []
 
 
 
     # Initialize output dictionaries
     yearly_paf = {}
+    failures: list[tuple[int, str]] = []
 
     # --- STEP 1: Get metadata for all storms in the draw ---
     storms_meta = iter_storms_metadata(intensity_draw_store)  # returns list of StormMeta
@@ -652,6 +675,7 @@ def process_single_draw(draw):
                         lat_col="lat",
                         lon_col="lon",
                         crs="EPSG:4326",
+                        expected_res=template_raster.transform.a,
                     ).resample_to(target=template_raster, resampling="nearest")
                     rr_values = storm_rr._ndarray
 
@@ -674,6 +698,7 @@ def process_single_draw(draw):
                     f"{basin}, year {year}): {type(e).__name__}: {e}"
                 )
                 traceback.print_exc()
+                failures.append((year, str(storm_id)))
                 continue
 
         # End of year calculations
@@ -684,7 +709,7 @@ def process_single_draw(draw):
         gc.collect()
 
     print(f"Completed draw {draw} for basin {basin}, batch {batch_year}")
-    return yearly_paf
+    return yearly_paf, failures
 
 def main(
     storm_draw: str,
@@ -746,6 +771,8 @@ def main(
         year: np.zeros_like(template_raster._ndarray, dtype=np.float32)
         for year in invalid_years
     }
+    # (draw, year, storm_id) for every storm that raised in any draw
+    failed_storms: list[tuple[int, int, str]] = []
 
     for batch_start in range(0, len(draws), batch_size):
         batch_draws = draws[batch_start: batch_start + batch_size]
@@ -778,8 +805,9 @@ def main(
         )
         print(f"Parallel job stage done for draw_batch: {batch_draws}")
 
-        # batch_results is a list of yearly_paf dictionaries returned from each draw
-        for draw_yearly_paf in batch_results:
+        # batch_results is a list of (yearly_paf, failures) returned from each draw
+        for draw, (draw_yearly_paf, draw_failures) in zip(batch_draws, batch_results):
+            failed_storms.extend((draw, year, sid) for year, sid in draw_failures)
             for year in invalid_years:
                 arr = draw_yearly_paf.get(year)
                 if arr is not None:
@@ -789,10 +817,16 @@ def main(
     n_draws = len(draws)
     final_paf = {year: arr / n_draws for year, arr in cumulative_paf.items()}
 
+    # Years with a failed storm are not saved, so they stay invalid and are
+    # recomputed on the retry; the other years are saved now.
+    failed_years = sorted({year for _, year, _ in failed_storms})
+
     # Save to disk per year, collecting the written paths for a single chmod
     # sweep at the end (avoids one os.walk per year).
     saved_paths: list[Path] = []
     for year in invalid_years:
+        if year in failed_years:
+            continue
         arr = final_paf[year]
 
         save_path = save_raster(
@@ -821,6 +855,15 @@ def main(
             os.chmod(path.parent, 0o775)
         except Exception as e:
             print(f"⚠️ Could not set permissions for {path}: {e}")
+
+    if failed_years:
+        # Non-zero exit so Jobmon marks the task failed and retries it; the
+        # retry recomputes only the unsaved (failed) years.
+        print(
+            f"❌ {len(failed_storms)} storm(s) failed; years {failed_years} not saved. "
+            f"(draw, year, storm): {failed_storms[:20]}"
+        )
+        raise SystemExit(1)
 
     print(f"Completed all draws for basin {basin}, batch {batch_year}")
 

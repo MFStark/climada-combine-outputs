@@ -14,6 +14,7 @@ from rasterio.features import shapes, rasterize  # type: ignore
 from rasterio.errors import WindowError  # type: ignore
 from rasterra import RasterArray  # type: ignore
 import shapely
+import shapely.affinity  # type: ignore
 from shapely.geometry import (
     box,
     shape,
@@ -51,18 +52,18 @@ ADMIN_LEVEL = args.admin_level
 
 
 # Constants
-ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2")
+ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v3")
 GRIDED_POP_PATH = Path("/mnt/team/rapidresponse/pub/population-model/results/2026_05_16/")
 POP_TOTALS_PATH = Path("/mnt/team/rapidresponse/pub/tropical-storms/fhs_population_2023_all_years.parquet")
 
 _SHP_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile")
 
 if ADMIN_LEVEL == 0:
-    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4b_v2/")
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4b_v3/")
     GDF_PATH = _SHP_ROOT / "global_WGS84_admin0.parquet"
     SHP_ROOT_NORMALIZED = _SHP_ROOT / "global_WGS84_admin0_normalized.parquet"
 elif ADMIN_LEVEL == 1:
-    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4b_v2_admin1/")
+    SAVE_ROOT = Path("/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage4b_v3_admin1/")
     GDF_PATH = _SHP_ROOT / "global_WGS84_admin1_0_360.parquet"
     SHP_ROOT_NORMALIZED = _SHP_ROOT / "global_WGS84_admin1_0_360.parquet"
 else:
@@ -107,18 +108,44 @@ def normalize_geom_to_0_360(geom):
         return x + 360 if x < 0 else x, y
     return shapely.ops.transform(shift_x, geom)
 
+_WEST_OF_180 = box(-360, -90, 180, 90)
+_EAST_OF_180 = box(180, -90, 540, 90)
+
+
 def normalize_longitudes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Shift geometries with x > 180 to x - 360 to avoid wraparound issues."""
+    """Move 0-360 geometries to -180..180.
+
+    Geometries entirely east of 180 are translated by -360. Geometries that
+    straddle 180 (e.g. Russia's Chukotka ring, Antarctica) are cut at 180
+    first and only the eastern part is translated; shifting vertex-by-vertex
+    would instead turn such a ring into an invalid shape spanning 360°.
+    """
     def shift_geom(geom):
-        if geom.is_empty:
+        if geom is None or geom.is_empty:
             return geom
-        def shift_coords(x, y, z=None):
-            x_new = x - 360 if x > 180 else x
-            return (x_new, y) if z is None else (x_new, y, z)
-        return shapely.ops.transform(shift_coords, geom)
+        minx, _, maxx, _ = geom.bounds
+        if maxx <= 180:
+            return geom
+        if minx >= 180:
+            return shapely.affinity.translate(geom, xoff=-360)
+        west = geom.intersection(_WEST_OF_180)
+        east = shapely.affinity.translate(geom.intersection(_EAST_OF_180), xoff=-360)
+        return _polygonize(unary_union([west, east]))
     gdf = gdf.copy()
     gdf["geometry"] = gdf["geometry"].apply(shift_geom)
     return gdf
+
+
+def to_pm180(geom):
+    """Translate a 0-360 geometry lying entirely east of 180 back to -180..180.
+
+    Used before reprojecting a piece's bbox to CEA: pyproj maps lon 180 to
+    +20,037 km but lon 181 to about -19,900 km, so a piece spanning 180..182
+    would otherwise yield a globe-wide (40,075 km) population window.
+    """
+    if geom.is_empty or geom.bounds[0] < 180:
+        return geom
+    return shapely.affinity.translate(geom, xoff=-360)
 
 def normalize_dataset(ds: xr.Dataset) -> xr.Dataset:
     ds = ds.assign_coords(
@@ -133,11 +160,30 @@ def to_raster(
     lat_col: str = "lat",
     lon_col: str = "lon",
     crs: str = "EPSG:4326",
+    expected_res: float | None = None,
 ) -> rt.RasterArray:
     lat, lon = ds[lat_col].data, ds[lon_col].data
 
     dlat = (lat[1:] - lat[:-1]).mean()
     dlon = (lon[1:] - lon[:-1]).mean()
+
+    # The affine transform assumes a regular grid at the stage 1 resolution.
+    # Stage 1 outputs written before the grid fix are evenly spaced at the
+    # WRONG step, so check the step itself, not just uniformity.
+    if expected_res is not None:
+        target_lat, target_lon = expected_res, expected_res
+    else:
+        target_lat, target_lon = abs(dlat), abs(dlon)
+    if not (
+        np.allclose(np.abs(np.diff(lat)), target_lat, atol=1e-6)
+        and np.allclose(np.abs(np.diff(lon)), target_lon, atol=1e-6)
+    ):
+        raise ValueError(
+            f"to_raster requires coords uniformly spaced at "
+            f"{expected_res if expected_res is not None else 'a constant step'}; "
+            f"got lat steps {np.unique(np.round(np.diff(lat), 6))}, "
+            f"lon steps {np.unique(np.round(np.diff(lon), 6))}"
+        )
 
     # 🔑 detect latitude direction
     lat_increasing = lat[1] > lat[0]
@@ -841,18 +887,32 @@ def save_yearly_exposure(
         print(f"⚠️ Could not set permissions for {save_path}: {e}")
 
 
-def _is_task_complete(row, save_root: Path = SAVE_ROOT) -> bool:
-    """Return True if a ≥1 KB output parquet already exists for this task."""
-    draw_dir = (
+def _task_output_paths(row, save_root: Path = SAVE_ROOT) -> list[Path]:
+    """Every path `save_storm_exposure` could write for this task: one per
+    year in batch_year (the storm's year comes from its start_date, which the
+    task row does not carry). Names use the unpadded storm_id, exactly as
+    `save_storm_exposure` writes them."""
+    start_year, end_year = row.batch_year.split("-")
+    draw = int(row.draw)
+    draw_text = "" if draw == 0 else f"_e{draw - 1}"
+    base = (
         save_root
         / row.source_id / row.variant_label / row.experiment_id
         / row.batch_year / row.basin
-        / f"tc_risk_draw_{int(row.draw)}" / "storm_exposure"
+        / f"tc_risk_draw_{draw}" / "storm_exposure"
     )
-    if not draw_dir.exists():
-        return False
-    pattern = f"storm_{int(row.storm_id):04d}_loc_{int(row.location_id)}_*.parquet"
-    return any(f.stat().st_size >= 1024 for f in draw_dir.rglob(pattern))
+    name = (
+        f"storm_{row.storm_id}_loc_{row.location_id}_{row.basin}_{row.source_id}_"
+        f"{row.variant_label}_{row.experiment_id}_{start_year}01_{end_year}12{draw_text}.parquet"
+    )
+    return [base / str(y) / name for y in range(int(start_year), int(end_year) + 1)]
+
+
+def _is_task_complete(row, save_root: Path = SAVE_ROOT) -> bool:
+    """Return True if a ≥1 KB output parquet already exists for this task."""
+    return any(
+        p.exists() and p.stat().st_size >= 1024 for p in _task_output_paths(row, save_root)
+    )
 
 
 def save_draw_dataframe(
@@ -981,9 +1041,10 @@ def process_single_storm(
             exposure_draw_store,
             storm_id,
         )
-    except (FileNotFoundError, KeyError):
+    except (FileNotFoundError, KeyError) as e:
+        # Stage 1 wrote intensity for this storm but not exposure.
         storm_ds.close()
-        return
+        raise RuntimeError(f"exposure missing in Stage 1 for storm {storm_id}") from e
 
     # Load large reference data only after confirming this storm needs processing
     if basin == "NA":
@@ -1023,7 +1084,8 @@ def process_single_storm(
         no_data_value=np.nan,
         lat_col="lat",
         lon_col="lon",
-        crs="EPSG:4326"
+        crs="EPSG:4326",
+        expected_res=template_raster.transform.a,
     ).resample_to(target=template_raster, resampling="nearest")
 
     # ---------------------------------------------------
@@ -1034,7 +1096,8 @@ def process_single_storm(
         no_data_value=np.nan,
         lat_col="lat",
         lon_col="lon",
-        crs="EPSG:4326"
+        crs="EPSG:4326",
+        expected_res=template_raster.transform.a,
     ).resample_to(target=template_raster, resampling="nearest")
     del template_raster
 
@@ -1104,6 +1167,7 @@ def process_single_storm(
     # ---------------------------------------------------
     # STEP 3: Admin-level calculations
     # ---------------------------------------------------
+    failed_admins = []
     for admin_shape in intersected_shapes.itertuples(index=False):
         admin_id = getattr(admin_shape, "loc_id", None)
         try:
@@ -1168,7 +1232,7 @@ def process_single_storm(
 
                 intersection = piece_wgs84.intersection(raster_bounds)
                 intersection_cea_bounds = (
-                    gpd.GeoSeries([intersection], crs="EPSG:4326")
+                    gpd.GeoSeries([to_pm180(intersection)], crs="EPSG:4326")
                     .to_crs("ESRI:54034")
                     .iloc[0]
                     .bounds
@@ -1232,10 +1296,16 @@ def process_single_storm(
                 f"{basin}, draw {draw}): {type(e).__name__}: {e}"
             )
             traceback.print_exc()
+            failed_admins.append(admin_id)
             continue
 
     # Free large objects that are no longer needed before saving
     del pop_df, max_wind_by_loc, intersected_shapes, exposure_raster
+
+    if failed_admins:
+        # Don't write a partial result; the task stays incomplete and the
+        # group exits non-zero so Jobmon retries it.
+        raise RuntimeError(f"admin(s) {failed_admins} failed for storm {storm_id}")
 
     # save storm-level exposure immediately
     if storm_records:
@@ -1283,27 +1353,43 @@ def main(grouped_tasks_parquet: str, group_id: int) -> None:
     group_hash = group_df["group_hash"].iloc[0]
     print(f"Group {group_id} (hash={group_hash[:8]}…): {total} tasks.")
 
+    failed_tasks = []
+    n_skipped = 0
     for i, row in enumerate(group_df.itertuples(index=False)):
+        # Retries (Jobmon or a relaunch) re-run the whole group; skip tasks
+        # whose output already exists.
+        if _is_task_complete(row):
+            n_skipped += 1
+            continue
         print(
             f"  [{i + 1}/{total}] "
             f"storm={row.storm_id} loc={row.location_id} "
             f"draw={row.draw} basin={row.basin} batch={row.batch_year}"
         )
-        process_single_storm(
-            source_id=row.source_id,
-            variant_label=row.variant_label,
-            experiment_id=row.experiment_id,
-            batch_year=row.batch_year,
-            basin=row.basin,
-            draw=row.draw,
-            storm_id=row.storm_id,
-            location_id=row.location_id,
-            num_cores=1,
-        )
+        try:
+            process_single_storm(
+                source_id=row.source_id,
+                variant_label=row.variant_label,
+                experiment_id=row.experiment_id,
+                batch_year=row.batch_year,
+                basin=row.basin,
+                draw=row.draw,
+                storm_id=row.storm_id,
+                location_id=row.location_id,
+                num_cores=1,
+            )
+        except Exception as e:
+            print(f"❌ Task storm={row.storm_id} loc={row.location_id} draw={row.draw} failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            failed_tasks.append((row.storm_id, row.location_id, int(row.draw)))
+    print(f"  {n_skipped} task(s) already complete (skipped).")
 
-    # Write sentinel only after all tasks complete without crashing.
-    # If the worker crashes mid-group, no sentinel is written and the group
-    # is resubmitted on the next launcher run.
+    # Write the sentinel only if every task succeeded. Otherwise exit
+    # non-zero: Jobmon retries the group (completed tasks are skipped above),
+    # and a relaunch resubmits it because no sentinel exists.
+    if failed_tasks:
+        print(f"❌ Group {group_id}: {len(failed_tasks)} task(s) failed {failed_tasks[:20]}; no sentinel written.")
+        raise SystemExit(1)
     _write_sentinel(group_hash)
     print(f"  ✅ Group {group_id} complete — sentinel written.")
 

@@ -1,5 +1,5 @@
 """
-Generate storm_draw_admin1_count.parquet
+Generate storm_draw_admin1_count_v3.parquet
 
 For each (storm_draw, source_id, variant_label, experiment_id, batch_year, basin) task:
   - n_storms_in_batch: count of storm_XXXX dirs in the base stage1 zarr
@@ -13,7 +13,7 @@ Intersection with the PAF raster therefore counts only FHS admin1 regions
 that a storm actually touches — storms that don't reach any FHS admin1
 polygon produce a count of 0 but are still included in the output.
 
-Output: /mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count.parquet
+Output: /mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count_v3.parquet
 """
 
 from pathlib import Path
@@ -47,13 +47,13 @@ GDF_PATH = Path(
     "/mnt/team/rapidresponse/pub/tropical-storms/data/global_shapefile/global_WGS84_admin1_0_360.parquet"
 )
 PAF_ROOT = Path(
-    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v2/"
+    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage2_v3/"
 )
 STAGE1_ROOT = Path(
-    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v2"
+    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/stage1_v3"
 )
 OUTPUT_PATH = Path(
-    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count.parquet"
+    "/mnt/team/rapidresponse/pub/tropical-storms/climada/output/storm_draw_admin1_count_v3.parquet"
 )
 
 NUM_CORES = 64
